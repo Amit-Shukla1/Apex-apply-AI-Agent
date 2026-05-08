@@ -1,0 +1,1 @@
+export const resumeTemplate = (data) => `<html><body style="font-family: Arial;"><h1>${data.name}</h1><p>${data.tailoredSummary}</p></body></html>`;
