@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 client/node_modules/
+user_data/
 
 # Environment Variables (CRITICAL)
 .env
