@@ -1,39 +1,36 @@
-import mongoose from "mongoose";
+import mongoose from 'mongoose';
 
 const jobLeadSchema = new mongoose.Schema(
-  {
-    jobTitle: { type: String, required: true },
-    company: { type: String, default: "Unknown" },
-    url: { type: String, required: true, unique: true }, // Prevent duplicate applications
-    location: { type: String, default: "Remote" },
+    {
+        jobTitle: { type: String, required: true },
+        company:  { type: String, default: 'Unknown' },
+        url:      { type: String, required: true, unique: true },
+        location: { type: String, default: 'Remote' },
 
-    // THE STATE MACHINE: This dictates what the orchestrator tells the bot to do next
-    status: {
-      type: String,
-      enum: [
-        "DISCOVERED",
-        "ANALYZING_FORM",
-        "APPLYING",
-        "CAPTCHA_BLOCKED",
-        "FAILED",
-        "APPLIED",
-      ],
-      default: "DISCOVERED",
+        status: {
+            type: String,
+            enum: [
+                'DISCOVERED',
+                'ANALYZING_FORM',
+                'APPLYING',
+                'CAPTCHA_BLOCKED',
+                'FAILED',
+                'FAILED_NEEDS_HEALING',   // was missing
+                'APPLIED',
+                'MANUAL_REVIEW_NEEDED',   // was missing
+            ],
+            default: 'DISCOVERED',
+        },
+
+        lastKnownHtml:       { type: String, default: null },
+        aiGeneratedSelector: { type: String, default: null },
+
+        logs: [{
+            timestamp: { type: Date, default: Date.now },
+            message: String,
+        }],
     },
-
-    // Persistent Memory for Self-Healing
-    lastKnownHtml: { type: String, default: null }, // Stores broken form HTML for the AI to fix
-    aiGeneratedSelector: { type: String, default: null }, // Stores the CSS selector the AI writes
-
-    // Audit Trail
-    logs: [
-      {
-        timestamp: { type: Date, default: Date.now },
-        message: String,
-      },
-    ],
-  },
-  { timestamps: true },
+    { timestamps: true }
 );
 
-export const JobLead = mongoose.model("JobLead", jobLeadSchema);
+export const JobLead = mongoose.model('JobLead', jobLeadSchema);
