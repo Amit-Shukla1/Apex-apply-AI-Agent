@@ -5,7 +5,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const randomDelay = (min = 2000, max = 5000) =>
   sleep(Math.floor(Math.random() * (max - min + 1)) + min);
 
-// If Groq returned a placeholder, default to Remote
+// ─── Strict job URL validator ──────────────────────────────────────────────────
+// Rejects homepages, docs, support pages, marketing — only real job listings.
+// Greenhouse: must be job-boards.greenhouse.io or boards.greenhouse.io with /jobs/{id}
+// Lever:      must be jobs.lever.co/{company}/{uuid}
+const isRealJobUrl = (url) => {
+  try {
+    const { hostname, pathname } = new URL(url);
+    if (hostname.includes("greenhouse.io")) {
+      const isBoard =
+        hostname.startsWith("job-boards.") || hostname.startsWith("boards.");
+      const hasJobId = /\/jobs\/\d+/.test(pathname);
+      return isBoard && hasJobId;
+    }
+    if (hostname.includes("lever.co")) {
+      const isJobsHost = hostname === "jobs.lever.co";
+      const hasUUID =
+        /\/[^/]+\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.test(
+          pathname,
+        );
+      return isJobsHost && hasUUID;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+};
+
 const cleanLocation = (loc) => {
   if (!loc) return "Remote";
   const placeholders = [
@@ -20,59 +46,38 @@ const cleanLocation = (loc) => {
   return loc;
 };
 
-// Wait for user to solve CAPTCHA if Google shows one
-const handleCaptcha = async (page, log) => {
-  const isCaptcha = await page
-    .evaluate(() => {
-      const body = document.body.innerText.toLowerCase();
-      return (
-        body.includes("unusual traffic") ||
-        body.includes("not a robot") ||
-        body.includes("captcha") ||
-        body.includes("recaptcha")
-      );
-    })
-    .catch(() => false);
-
-  if (isCaptcha) {
-    log("⚠️ CAPTCHA detected! Please solve it in the browser window...");
-    // Wait up to 2 minutes for user to solve it
-    let solved = false;
-    for (let i = 0; i < 24; i++) {
-      await sleep(5000);
-      const stillCaptcha = await page
-        .evaluate(() => {
-          const body = document.body.innerText.toLowerCase();
-          return (
-            body.includes("unusual traffic") ||
-            body.includes("not a robot") ||
-            body.includes("captcha")
-          );
-        })
-        .catch(() => false);
-
-      if (!stillCaptcha) {
-        solved = true;
-        log("✅ CAPTCHA solved! Continuing...");
-        break;
-      }
-      log(`⏳ Waiting for CAPTCHA solve... (${(i + 1) * 5}s)`);
-    }
-
-    if (!solved) {
-      log("❌ CAPTCHA timeout. Skipping this search.");
-      return false;
-    }
+// ─── DuckDuckGo HTML search ────────────────────────────────────────────────────
+const searchDDG = async (page, query, log) => {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await sleep(1000);
+  } catch (e) {
+    log(`⚠️  DDG load failed: ${e.message.split("\n")[0]}`);
+    return [];
   }
-  return true;
+
+  const rawUrls = await page.evaluate(() => {
+    const links = Array.from(
+      document.querySelectorAll("a.result__a, a.result__url"),
+    );
+    return links
+      .map((a) => {
+        let href = a.href || "";
+        if (href.includes("duckduckgo.com/l/")) {
+          const match = href.match(/uddg=([^&]+)/);
+          if (match) href = decodeURIComponent(match[1]);
+        }
+        return href;
+      })
+      .filter((href) => href && href.startsWith("http"));
+  });
+
+  return [...new Set(rawUrls.filter(isRealJobUrl))].slice(0, 10);
 };
 
-export const runDiscoveryAgent = async (
-  profile,
-  location,
-  io,
-  platform = "Google",
-) => {
+// ─── Main Discovery Agent ─────────────────────────────────────────────────────
+export const runDiscoveryAgent = async (profile, location, io) => {
   const log = (msg) => io.emit("log", { message: `[APEX DISCOVERY]: ${msg}` });
 
   const titles = profile.titles || ["Software Engineer"];
@@ -92,61 +97,24 @@ export const runDiscoveryAgent = async (
     let totalSaved = 0;
 
     for (const title of titles) {
-      // Back to Google — it finds the most results
-      const searchQuery = `site:greenhouse.io OR site:lever.co ${title} ${cleanedLocation}`;
-      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`;
-
+      const query = `site:greenhouse.io OR site:lever.co ${title} ${cleanedLocation}`;
       log(`🔍 Searching: ${title} — ${cleanedLocation}`);
 
-      try {
-        await page.goto(searchUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: 20000,
-        });
-        await sleep(1500);
-      } catch (e) {
-        log(`⚠️ Search failed for "${title}": ${e.message}`);
-        continue;
-      }
+      const urls = await searchDDG(page, query, log);
+      log(`   Found ${urls.length} valid job lead(s) for "${title}"`);
 
-      // Handle CAPTCHA before extracting
-      const ok = await handleCaptcha(page, log);
-      if (!ok) continue;
-
-      // Extract greenhouse/lever URLs from Google results
-      const urls = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll("a"));
-        return links
-          .map((a) => a.href)
-          .filter(
-            (href) =>
-              href &&
-              (href.includes("boards.greenhouse.io") ||
-                href.includes("jobs.lever.co") ||
-                href.includes("greenhouse.io") ||
-                href.includes("lever.co")) &&
-              !href.includes("google.com") &&
-              !href.includes("webcache") &&
-              href.startsWith("http"),
-          );
-      });
-
-      const uniqueUrls = [...new Set(urls)].slice(0, 10);
-      log(`Found ${uniqueUrls.length} leads for "${title}"`);
-
-      for (const url of uniqueUrls) {
+      for (const url of urls) {
         const exists = await JobLead.findOne({ url });
         if (exists) {
-          log(`⏭️ Already tracked: ${url}`);
+          log(`⏭️  Already tracked: ${url}`);
           continue;
         }
 
         log(`🔎 Inspecting: ${url}`);
-
         try {
           await page.goto(url, {
             waitUntil: "domcontentloaded",
-            timeout: 15000,
+            timeout: 20000,
           });
           await randomDelay(1000, 2000);
 
@@ -155,13 +123,8 @@ export const runDiscoveryAgent = async (
             .catch(() => "");
 
           if (profile.minSalary || profile.maxSalary) {
-            const passes = passesSalaryFilter(
-              jobText,
-              profile.minSalary,
-              profile.maxSalary,
-            );
-            if (!passes) {
-              log(`⚠️ Dropped: Salary below requirement`);
+            if (!passesSalaryFilter(jobText, profile.minSalary)) {
+              log(`⚠️  Dropped: salary below requirement`);
               continue;
             }
           }
@@ -176,50 +139,45 @@ export const runDiscoveryAgent = async (
           totalSaved++;
           log(`✅ Acquired: ${newLead.company} — ${title}`);
         } catch (e) {
-          log(`⚠️ Could not inspect ${url}: ${e.message}`);
+          log(`⚠️  Could not inspect ${url}: ${e.message.split("\n")[0]}`);
         }
       }
 
-      // Random delay between searches — avoids triggering Google bot detection
-      await randomDelay(4000, 8000);
+      await randomDelay(3000, 6000);
     }
 
     log(`🏁 Discovery complete. ${totalSaved} new leads saved.`);
     await context.close();
   } catch (err) {
-    log(`❌ Discovery Error: ${err.message}`);
+    log(`❌ Discovery error: ${err.message}`);
     if (context) await context.close();
   }
 };
 
-const passesSalaryFilter = (jobDescription, minUserSalary, maxUserSalary) => {
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const passesSalaryFilter = (jobDescription, minUserSalary) => {
   const text = jobDescription.toLowerCase().replace(/,/g, "");
   const salaries = [];
   let match;
-
   const fullNumRegex = /\$?\b([1-9]\d{4,5})\b/g;
   while ((match = fullNumRegex.exec(text)) !== null)
     salaries.push(parseInt(match[1]));
-
   const kRegex = /\$?\b([1-9]\d{1,2})k\b/g;
   while ((match = kRegex.exec(text)) !== null)
     salaries.push(parseInt(match[1]) * 1000);
-
   if (salaries.length === 0) return true;
-
   const jobMax = Math.max(...salaries);
   const userMin = minUserSalary
     ? parseInt(minUserSalary.toString().replace(/\D/g, ""))
     : 0;
-
   return jobMax >= userMin;
 };
 
 const extractCompanyName = (url) => {
   try {
-    const parsed = new URL(url);
-    const parts = parsed.pathname.split("/").filter((p) => p);
-    return parts[0] ? parts[0].replace(/-/g, " ").toUpperCase() : "UNKNOWN";
+    const { pathname } = new URL(url);
+    const parts = pathname.split("/").filter((p) => p);
+    return parts[0]?.replace(/-/g, " ").toUpperCase() || "UNKNOWN";
   } catch {
     return "UNKNOWN";
   }

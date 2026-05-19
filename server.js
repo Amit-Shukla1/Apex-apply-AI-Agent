@@ -147,6 +147,18 @@ app.delete("/api/leads/clear/all", async (req, res) => {
   }
 });
 
+app.post("/api/leads/:id/retry", async (req, res) => {
+  try {
+    await JobLead.findByIdAndUpdate(req.params.id, {
+      status: "DISCOVERED",
+      skipReason: null,
+    });
+    res.json({ message: "Lead reset to DISCOVERED" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to retry lead" });
+  }
+});
+
 app.delete("/api/leads/:id", async (req, res) => {
   try {
     await JobLead.findByIdAndDelete(req.params.id);
