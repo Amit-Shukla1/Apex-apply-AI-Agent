@@ -403,6 +403,18 @@ export default function App() {
       document.getElementById("f-relocate")?.value ||
       profile?.willingToRelocate ||
       "No",
+    skills:
+      (document.getElementById("f-skills")?.value || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean).length > 0
+        ? (document.getElementById("f-skills")?.value || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : profile?.skills || [],
+    whyHireYou:
+      document.getElementById("f-whyhire")?.value || profile?.whyHireYou || "",
   });
 
   const deployAgent = async (platform) => {
@@ -802,6 +814,121 @@ export default function App() {
                         <option value="No">No</option>
                       </select>
                     </div>
+                    <div className="field">
+                      <label>Skills (comma-separated)</label>
+                      <input
+                        id="f-skills"
+                        defaultValue={(profile.skills || []).join(", ")}
+                        placeholder="React, Node.js, MongoDB, Python"
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Why should we hire you?</label>
+                      <textarea
+                        id="f-whyhire"
+                        defaultValue={profile.whyHireYou || ""}
+                        placeholder="Write 2-3 sentences about your fit for the role..."
+                        style={{
+                          background: "var(--panel2)",
+                          border: "1px solid var(--border2)",
+                          borderRadius: 5,
+                          padding: "7px 9px",
+                          fontFamily: "var(--mono)",
+                          fontSize: 11,
+                          color: "var(--text)",
+                          outline: "none",
+                          resize: "vertical",
+                          minHeight: 72,
+                          width: "100%",
+                        }}
+                      />
+                    </div>
+                    <button
+                      onClick={() => {
+                        const updated = {
+                          ...profile,
+                          email:
+                            document.getElementById("f-email")?.value ||
+                            profile.email,
+                          phone:
+                            document.getElementById("f-phone")?.value ||
+                            profile.phone,
+                          location:
+                            document.getElementById("f-loc")?.value ||
+                            profile.location,
+                          minSalary:
+                            document.getElementById("f-min")?.value || "",
+                          maxSalary:
+                            document.getElementById("f-max")?.value || "",
+                          linkedinUrl:
+                            document.getElementById("f-linkedin")?.value ||
+                            profile.linkedinUrl ||
+                            "",
+                          githubUrl:
+                            document.getElementById("f-github")?.value ||
+                            profile.githubUrl ||
+                            "",
+                          portfolioUrl:
+                            document.getElementById("f-portfolio")?.value ||
+                            profile.portfolioUrl ||
+                            "",
+                          educationSchool:
+                            document.getElementById("f-school")?.value ||
+                            profile.educationSchool ||
+                            "",
+                          educationDegree:
+                            document.getElementById("f-degree")?.value ||
+                            profile.educationDegree ||
+                            "",
+                          educationField:
+                            document.getElementById("f-discipline")?.value ||
+                            profile.educationField ||
+                            "",
+                          educationStartYear:
+                            document.getElementById("f-startyear")?.value ||
+                            profile.educationStartYear ||
+                            "",
+                          educationEndYear:
+                            document.getElementById("f-endyear")?.value ||
+                            profile.educationEndYear ||
+                            "",
+                          willingToRelocate:
+                            document.getElementById("f-relocate")?.value ||
+                            "No",
+                          skills: (
+                            document.getElementById("f-skills")?.value || ""
+                          )
+                            .split(",")
+                            .map((s) => s.trim())
+                            .filter(Boolean),
+                          whyHireYou:
+                            document.getElementById("f-whyhire")?.value || "",
+                        };
+                        setProfile(updated);
+                        localStorage.setItem(
+                          "apexProfile",
+                          JSON.stringify(updated),
+                        );
+                        addLog("✅ Profile saved.");
+                        setProfileExpanded(false);
+                      }}
+                      style={{
+                        width: "100%",
+                        marginTop: 8,
+                        padding: "8px",
+                        background: "rgba(232,184,75,0.12)",
+                        border: "1px solid rgba(232,184,75,0.4)",
+                        borderRadius: 5,
+                        color: "var(--gold)",
+                        fontFamily: "var(--mono)",
+                        fontSize: 11,
+                        fontWeight: 700,
+                        cursor: "pointer",
+                        letterSpacing: ".08em",
+                      }}
+                    >
+                      💾 SAVE PROFILE
+                    </button>
                   </div>
                 )}
               </div>

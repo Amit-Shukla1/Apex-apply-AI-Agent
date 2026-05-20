@@ -1,4 +1,5 @@
 import { launchBrowser } from "../services/browser.manager.js";
+import { detectPlatform, platformMap } from "./platform.adapter.js";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -231,8 +232,66 @@ function deterministicMap(fingerprints, profile) {
     ) {
       value = profile.currentTitle || "";
     } else if (/years.*exp|experience.*year/.test(c)) {
-      value = String(profile.yearsOfExperience || "");
-    } else if (/\bsummary\b|cover[\s-]?letter|about[\s-]?you|message/.test(c)) {
+      // If it's a radio group, pick the matching option; otherwise fill
+      if (t === "radio" && f.options?.length) {
+        const yrs = parseInt(profile.yearsOfExperience) || 0;
+        const match = f.options.find((o) => {
+          const nums = String(o.label || o.value || "").match(/\d+/g) || [];
+          return nums.some((n) => Math.abs(parseInt(n) - yrs) <= 1);
+        });
+        value = match ? String(match.value) : String(f.options[0]?.value || "");
+        actionType = "radio";
+      } else {
+        value = String(profile.yearsOfExperience || "");
+      }
+
+      // ── Motivation / why hire you ─────────────────────────────────────────
+    } else if (
+      /why.*hire|why.*good.*fit|why.*apply|why.*interest|why.*role|why.*position|what.*motivat|why.*want/i.test(
+        c,
+      ) &&
+      t !== "checkbox" &&
+      t !== "select"
+    ) {
+      value = profile.whyHireYou || profile.summary || "";
+
+      // ── Proficiency / rating ──────────────────────────────────────────────
+    } else if (
+      /proficien|fluent|english.*level|language.*level|rate.*yourself|communication|skill.*level/i.test(
+        c,
+      ) &&
+      (t === "radio" || t === "select")
+    ) {
+      const preferred = [
+        "native",
+        "fluent",
+        "proficient",
+        "advanced",
+        "c2",
+        "c1",
+        "b2",
+      ];
+      const opts = (f.options || []).map((o) =>
+        typeof o === "object" ? o : { value: o, label: String(o) },
+      );
+      const bestOpt = preferred
+        .map((p) =>
+          opts.find((o) =>
+            String(o.label || o.value)
+              .toLowerCase()
+              .includes(p),
+          ),
+        )
+        .find(Boolean);
+      value = bestOpt
+        ? String(bestOpt.value)
+        : String(opts[opts.length - 1]?.value || "");
+      actionType = t === "radio" ? "radio" : "select";
+    } else if (
+      /\bsummary\b|cover[\s-]?letter|about[\s-]?you|additional.*info|message|anything.*else/i.test(
+        c,
+      )
+    ) {
       value = profile.summary || "";
     } else if (
       /\bsalary\b|\bcompensation\b|\bpay\b/.test(c) &&
@@ -378,17 +437,21 @@ ${JSON.stringify(validSelectors)}
 ## Output: raw JSON array only, no markdown, no explanation.
 
 Each element:
-- Text input:    { "selector": "...", "action": "fill",   "value": "text" }
-- Select/dropdown: { "selector": "...", "action": "select", "value": "exact option label" }
-- Radio button:  { "selector": "...", "action": "radio",  "value": "radio value attr" }
-- Checkbox:      { "selector": "...", "action": "check",  "value": true }
-- Can't map:     { "selector": "...", "action": "fill",   "value": "", "unanswered": true }
+- Text/textarea input: { "selector": "...", "action": "fill",   "value": "text from profile" }
+- Select/dropdown:     { "selector": "...", "action": "select", "value": "exact option label" }
+- Radio button group:  { "selector": "...", "action": "radio",  "value": "exact radio value attr from options" }
+- Checkbox:            { "selector": "...", "action": "check",  "value": true }
+- Cannot map:          { "selector": "...", "action": "fill",   "value": "", "unanswered": true }
 
-RULES:
-1. ONLY use selectors from the valid list — never invent selectors
-2. Checkboxes MUST use action "check" with boolean value — NEVER use "fill" for checkboxes
-3. For SELECT, value must exactly match one of the listed options
-4. Skip optional fields you cannot confidently map`;
+CRITICAL RULES:
+1. ONLY use selectors from the valid list — NEVER invent or modify selectors
+2. RADIO fields (t="radio"): MUST use action "radio". Value MUST be one of the listed option values (o field). NEVER use "fill" for radio.
+3. CHECKBOX fields: MUST use action "check" with boolean. NEVER use "fill".
+4. SELECT fields: value must exactly match one of the listed option labels.
+5. Map fields to the SEMANTICALLY CORRECT profile value. Do NOT assign name/email to experience or proficiency fields.
+6. For proficiency/rating radios: pick the highest confidence option (e.g. "Proficient", "Fluent", "Advanced", "Yes").
+7. For yes/no radios about work authorization: pick "Yes".
+8. Skip optional fields you cannot confidently map — return unanswered: true.`;
 
   const res = await callGroq({
     model: GROQ_MODEL,
@@ -464,7 +527,7 @@ async function executeActions(page, actions, log) {
     try {
       switch (action.action) {
         case "fill": {
-          // FIX: detect checkbox and auto-switch to click
+          // Detect checkbox and auto-switch to click
           const elType = await page
             .evaluate(
               (sel) => document.querySelector(sel)?.type || "",
@@ -481,9 +544,40 @@ async function executeActions(page, actions, log) {
             if (shouldCheck !== checked)
               await page.click(action.selector, { timeout: 5000 });
           } else {
-            await page.fill(action.selector, String(action.value), {
-              timeout: 5000,
-            });
+            // React-compatible fill: use native value setter + dispatch events
+            // This is the same trick Simplify/Chrome extensions use to trigger
+            // React's synthetic event system (plain .value= doesn't work).
+            const filled = await page
+              .evaluate(
+                ({ sel, val }) => {
+                  const el = document.querySelector(sel);
+                  if (!el) return false;
+                  // Native value setter bypasses React's read-only descriptor
+                  const proto =
+                    el.tagName === "TEXTAREA"
+                      ? window.HTMLTextAreaElement.prototype
+                      : window.HTMLInputElement.prototype;
+                  const setter = Object.getOwnPropertyDescriptor(
+                    proto,
+                    "value",
+                  )?.set;
+                  if (setter) setter.call(el, val);
+                  else el.value = val;
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  el.dispatchEvent(new Event("blur", { bubbles: true }));
+                  return true;
+                },
+                { sel: action.selector, val: String(action.value) },
+              )
+              .catch(() => false);
+
+            // Fallback to Playwright fill if evaluate didn't work
+            if (!filled) {
+              await page.fill(action.selector, String(action.value), {
+                timeout: 5000,
+              });
+            }
           }
           break;
         }
@@ -853,10 +947,33 @@ export const runApplicationAgent = async (
     job.status = "APPLYING";
     await job.save();
 
-    // ── Phase 1: Deterministic mapping ────────────────────────────────────
-    log(`⚡ Running deterministic label matcher...`);
+    // ── Phase 0: Platform-specific name-attr mapping (Greenhouse / Lever) ─────
+    const platform = detectPlatform(job.url);
+    let platformActions = [];
+    let handledSelectors = new Set();
+
+    if (platform) {
+      log(`🏷️  Platform detected: ${platform.toUpperCase()}`);
+      const result = platformMap(platform, fingerprints, profile, log);
+      platformActions = result.actions;
+      handledSelectors = result.handled;
+    } else {
+      log(
+        `⚙️  Unknown platform — skipping name-attr mapping, using label matcher.`,
+      );
+    }
+
+    // Filter fingerprints already handled by platform adapter
+    const remainingAfterPlatform = fingerprints.filter(
+      (f) => !handledSelectors.has(f.selector),
+    );
+
+    // ── Phase 1: Deterministic label matcher (on remaining fields only) ───────
+    log(
+      `⚡ Running deterministic label matcher on ${remainingAfterPlatform.length} remaining fields...`,
+    );
     const { actions: deterministicActions, unmatched } = deterministicMap(
-      fingerprints,
+      remainingAfterPlatform,
       profile,
     );
     log(
@@ -875,8 +992,14 @@ export const runApplicationAgent = async (
       }
     }
 
-    const allActions = [...deterministicActions, ...groqActions];
-    log(`📋 Total actions: ${allActions.length}`);
+    const allActions = [
+      ...platformActions,
+      ...deterministicActions,
+      ...groqActions,
+    ];
+    log(
+      `📋 Total actions: ${allActions.length} (platform: ${platformActions.length}, deterministic: ${deterministicActions.length}, groq: ${groqActions.length})`,
+    );
 
     // ── Attach resume ──────────────────────────────────────────────────────
     await attachResume(page, profile.resumePath, log);
