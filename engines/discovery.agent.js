@@ -76,13 +76,32 @@ const searchDDG = async (page, query, log) => {
   return [...new Set(rawUrls.filter(isRealJobUrl))].slice(0, 10);
 };
 
+// Extract just the country from "City, Country" — used for broader DDG searches.
+// Greenhouse/Lever are global platforms; city-level searches return almost nothing.
+const getCountryHint = (loc) => {
+  if (!loc || loc === "Remote") return null;
+  const parts = loc.split(",").map((s) => s.trim()).filter(Boolean);
+  // If only one part, it might be a country already
+  return parts[parts.length - 1] || null;
+};
+
 // ─── Main Discovery Agent ─────────────────────────────────────────────────────
 export const runDiscoveryAgent = async (profile, location, io) => {
   const log = (msg) => io.emit("log", { message: `[APEX DISCOVERY]: ${msg}` });
 
   const titles = profile.titles || ["Software Engineer"];
   const cleanedLocation = cleanLocation(location || profile.location);
-  log(`Initiating scan for ${titles.length} titles in "${cleanedLocation}"...`);
+
+  // Greenhouse/Lever are global remote-first platforms — searching by small
+  // city returns almost nothing. Always search "remote" + optionally country.
+  const countryHint = getCountryHint(cleanedLocation);
+  const searchLocations = ["remote"];
+  if (countryHint && countryHint.toLowerCase() !== "remote") {
+    searchLocations.push(countryHint);
+  }
+  log(
+    `Initiating scan for ${titles.length} titles (searching: ${searchLocations.join(", ")})...`,
+  );
 
   let context;
   try {
@@ -97,10 +116,20 @@ export const runDiscoveryAgent = async (profile, location, io) => {
     let totalSaved = 0;
 
     for (const title of titles) {
-      const query = `site:greenhouse.io OR site:lever.co ${title} ${cleanedLocation}`;
-      log(`🔍 Searching: ${title} — ${cleanedLocation}`);
+      const urlSet = new Set();
 
-      const urls = await searchDDG(page, query, log);
+      for (let i = 0; i < searchLocations.length; i++) {
+        const loc = searchLocations[i];
+        const query = `site:greenhouse.io OR site:lever.co ${title} ${loc}`;
+        log(`🔍 Searching: ${title} — ${loc}`);
+        const urls = await searchDDG(page, query, log);
+        urls.forEach((u) => urlSet.add(u));
+        if (i < searchLocations.length - 1) {
+          await randomDelay(1500, 3000);
+        }
+      }
+
+      const urls = [...urlSet];
       log(`   Found ${urls.length} valid job lead(s) for "${title}"`);
 
       for (const url of urls) {

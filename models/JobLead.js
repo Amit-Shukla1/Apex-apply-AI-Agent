@@ -27,7 +27,8 @@ const jobLeadSchema = new mongoose.Schema(
     relevanceScore: { type: Number, default: null }, // 0-100
     skipReason: { type: String, default: null }, // why it was skipped
 
-    // NEW: Response tracking
+    // Submission + response tracking
+    appliedAt: { type: Date, default: null }, // when agent successfully submitted
     respondedAt: { type: Date, default: null }, // when company replied
     responseType: {
       // what kind of reply

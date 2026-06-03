@@ -1,5 +1,6 @@
 import { launchBrowser } from "../services/browser.manager.js";
 import { detectPlatform, platformMap } from "./platform.adapter.js";
+import { FieldRegistry } from "../models/FieldRegistry.js";
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -187,7 +188,7 @@ function deterministicMap(fingerprints, profile) {
     } else if (
       /\bfull[\s_-]?name\b|\bname\b/.test(c) &&
       t !== "checkbox" &&
-      t !== "select"
+      !t.startsWith("select")
     ) {
       value = profile.name || `${firstName} ${lastName}`.trim();
     }
@@ -208,7 +209,7 @@ function deterministicMap(fingerprints, profile) {
       value = city;
     } else if (/\bcountry\b/.test(c)) {
       value = country;
-      actionType = t === "select" ? "select" : "autocomplete";
+      actionType = t.startsWith("select") ? "select" : "autocomplete";
     }
 
     // ── URLs ──────────────────────────────────────────────────────────────
@@ -228,7 +229,7 @@ function deterministicMap(fingerprints, profile) {
       value = profile.currentCompany || "";
     } else if (
       /current[\s-]?title|job[\s-]?title|position/.test(c) &&
-      t !== "select"
+      !t.startsWith("select")
     ) {
       value = profile.currentTitle || "";
     } else if (/years.*exp|experience.*year/.test(c)) {
@@ -251,7 +252,7 @@ function deterministicMap(fingerprints, profile) {
         c,
       ) &&
       t !== "checkbox" &&
-      t !== "select"
+      !t.startsWith("select")
     ) {
       value = profile.whyHireYou || profile.summary || "";
 
@@ -260,7 +261,7 @@ function deterministicMap(fingerprints, profile) {
       /proficien|fluent|english.*level|language.*level|rate.*yourself|communication|skill.*level/i.test(
         c,
       ) &&
-      (t === "radio" || t === "select")
+      (t === "radio" || t.startsWith("select"))
     ) {
       const preferred = [
         "native",
@@ -307,14 +308,17 @@ function deterministicMap(fingerprints, profile) {
         (profile.education || "").split(",")[0].trim();
     } else if (/\bdegree\b/.test(c)) {
       value = profile.educationDegree || "Bachelor's Degree";
-      actionType = t === "select" ? "select" : "fill";
+      actionType = t.startsWith("select") ? "select" : "fill";
     } else if (/field.*study|major|discipline/.test(c)) {
       value = profile.educationField || "Computer Science";
     } else if (/start[\s-]?year/.test(c)) {
       value = profile.educationStartYear || "";
     } else if (/end[\s-]?year|graduation|grad[\s-]?year/.test(c)) {
       value = profile.educationEndYear || profile.graduationYear || "";
-    } else if (/relocate|willing.*move|open.*reloc/.test(c) && t === "select") {
+    } else if (
+      /relocate|willing.*move|open.*reloc/.test(c) &&
+      t.startsWith("select")
+    ) {
       value = profile.willingToRelocate || "No";
       actionType = "select";
     } else if (/relocate|willing.*move|open.*reloc/.test(c)) {
@@ -323,26 +327,29 @@ function deterministicMap(fingerprints, profile) {
 
     // ── Work Auth / EEO ───────────────────────────────────────────────────
     else if (/work[\s-]?auth|authorized|legally[\s-]?eligible/.test(c)) {
-      value = t === "select" ? "Yes" : null;
+      value = t.startsWith("select") ? "Yes" : null;
       actionType = "select";
-    } else if (/\bvisa\b|sponsor/.test(c) && t === "select") {
+    } else if (/\bvisa\b|sponsor/.test(c) && t.startsWith("select")) {
       value = "No";
       actionType = "select";
-    } else if (/\bgender\b|\bsex\b/.test(c) && t === "select") {
+    } else if (/\bgender\b|\bsex\b/.test(c) && t.startsWith("select")) {
       value = profile.gender || "Decline to self-identify";
       actionType = "select";
-    } else if (/\brace\b|ethnic/.test(c) && t === "select") {
+    } else if (
+      /\brace\b|ethnic|hispanic|latino/.test(c) &&
+      t.startsWith("select")
+    ) {
       value = profile.ethnicity || "Decline to self-identify";
       actionType = "select";
-    } else if (/\bveteran\b/.test(c) && t === "select") {
+    } else if (/\bveteran\b/.test(c) && t.startsWith("select")) {
       value = profile.veteran || "I am not a protected veteran";
       actionType = "select";
-    } else if (/\bdisability\b/.test(c) && t === "select") {
+    } else if (/\bdisability\b/.test(c) && t.startsWith("select")) {
       value = profile.disability || "I don't wish to answer";
       actionType = "select";
     } else if (
       /how.*hear|source|referral|where.*find/.test(c) &&
-      t === "select"
+      t.startsWith("select")
     ) {
       value = "LinkedIn";
       actionType = "select";
@@ -404,7 +411,10 @@ async function callGroq(payload, retries = 3) {
 function compressForGroq(fingerprints) {
   return fingerprints.map((f) => {
     const c = { s: f.selector, l: f.label, t: f.type, r: f.required };
-    if ((f.type === "select" || f.type === "radio") && f.options?.length)
+    if (
+      (f.type.startsWith("select") || f.type === "radio") &&
+      f.options?.length
+    )
       c.o = f.options;
     if (f.groupName) c.g = f.groupName;
     return c;
@@ -582,13 +592,70 @@ async function executeActions(page, actions, log) {
           break;
         }
 
-        case "select":
-          await page.selectOption(
-            action.selector,
-            { label: String(action.value) },
-            { timeout: 5000 },
-          );
+        case "select": {
+          // 3-tier fuzzy select (same approach as Simplify):
+          // 1. Exact label match
+          // 2. Case-insensitive match
+          // 3. Neutral-keyword fallback for EEO/optional fields
+          //    ("decline", "prefer not", "wish to answer", "self-identify", etc.)
+          const target = String(action.value).toLowerCase().trim();
+          const options = await page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return [];
+            return Array.from(el.options).map((o) => ({
+              value: o.value,
+              text: o.text.trim(),
+            }));
+          }, action.selector);
+
+          if (options.length === 0) {
+            log(`⚠️  select: no options found for ${action.selector}`);
+            break;
+          }
+
+          // Tier 1: exact
+          let match = options.find((o) => o.text === String(action.value));
+          // Tier 2: case-insensitive
+          if (!match)
+            match = options.find((o) => o.text.toLowerCase() === target);
+          // Tier 3: partial keyword match (handles "Decline to Self-Identify" vs "Decline to self-identify")
+          if (!match)
+            match = options.find((o) =>
+              o.text.toLowerCase().includes(target.split(" ")[0]),
+            );
+          // Tier 4: neutral fallback — for EEO/optional fields, find "safe" option
+          if (!match) {
+            const NEUTRAL = [
+              "decline",
+              "prefer not",
+              "wish to answer",
+              "self-identify",
+              "rather not",
+              "no response",
+              "choose not",
+              "not disclosed",
+            ];
+            match = options.find((o) =>
+              NEUTRAL.some((kw) => o.text.toLowerCase().includes(kw)),
+            );
+          }
+          // Tier 5: skip first empty/placeholder option, pick first real option as last resort
+          if (!match)
+            match = options.find((o) => o.value !== "" && o.value !== "0");
+
+          if (match) {
+            await page.selectOption(
+              action.selector,
+              { label: match.text },
+              { timeout: 5000 },
+            );
+          } else {
+            log(
+              `⚠️  select: no match found for "${action.value}" in ${action.selector}`,
+            );
+          }
           break;
+        }
 
         // FIX: Custom autocomplete dropdown (country, location fields that aren't real <select>)
         case "autocomplete": {
@@ -693,7 +760,13 @@ async function verifyFill(page, actions, originalFingerprints, log) {
               results.push({ ...action, status: "NOT_FOUND", actual: null });
               break;
             }
-            const match = el.value.trim() === String(action.value).trim();
+            // Strip all formatting chars for phone/tel fields — carriers and
+            // browser phone-input libraries insert spaces in different positions.
+            const isPhoneLike = /phone|mobile|tel/i.test(action.selector);
+            const normalize = (s) => String(s).replace(/[\s\-()+]/g, "");
+            const match = isPhoneLike
+              ? normalize(el.value) === normalize(String(action.value))
+              : el.value.trim() === String(action.value).trim();
             results.push({
               ...action,
               status: match ? "OK" : "MISMATCH",
@@ -825,7 +898,14 @@ function scoreJobRelevance(jobText, profile) {
   }
 
   const candidateYears = parseInt(profile.yearsOfExperience) || 0;
-  if (requiredYears > 0 && candidateYears < requiredYears) {
+  // Only hard-skip on experience if the profile actually has years set.
+  // If yearsOfExperience is 0/missing, skip the experience gate entirely
+  // so the user doesn't get blocked just because they forgot to fill that field.
+  if (
+    candidateYears > 0 &&
+    requiredYears > 0 &&
+    candidateYears < requiredYears
+  ) {
     return {
       score: 0,
       skip: true,
@@ -841,7 +921,18 @@ function scoreJobRelevance(jobText, profile) {
       reason: "No skills in profile — add skills for better matching.",
     };
 
-  const matched = skills.filter((s) => text.includes(s));
+  // Fuzzy skill matching — handles React.js/ReactJS/React, Node.js/NodeJS/Node etc.
+  // For each skill, build variants: raw, stripped of .js, stripped of spaces/dots
+  const skillVariants = skills.map((s) => [
+    s, // "react.js"
+    s.replace(/\.js$/i, ""), // "react"
+    s.replace(/[.\s]/g, ""), // "reactjs"
+    s.replace(/[.\s-]/g, " ").trim(), // "react js" → normalized
+  ]);
+
+  const matched = skillVariants.filter((variants) =>
+    variants.some((v) => v && text.includes(v)),
+  );
   const score = Math.round((matched.length / skills.length) * 100);
   if (score < 25) {
     return {
@@ -882,6 +973,94 @@ async function findSubmitButton(page) {
   return null;
 }
 
+// ─── ATS Field Registry helpers ───────────────────────────────────────────────
+// inferMapsTo: tries to identify which profile key produced a given value.
+// Works well for unique strings (email, phone, urls, names).
+// Returns null for static option values (Yes/No, EEO answers, etc.) — that's fine,
+// the selector+action pair is still useful in the registry even without mapsTo.
+function inferMapsTo(value, profile) {
+  if (value === null || value === undefined) return null;
+  const needle = String(value).trim().toLowerCase();
+  if (!needle) return null;
+  for (const [key, val] of Object.entries(profile)) {
+    if (val === null || val === undefined) continue;
+    if (typeof val === "object") continue; // skip arrays, objects
+    if (String(val).trim().toLowerCase() === needle) return key;
+  }
+  return null;
+}
+
+// saveToRegistry: persists verified+submitted fills to MongoDB.
+// SAFETY CONTRACT: caller MUST only invoke this when:
+//   - mismatches.length === 0 (after retry)
+//   - newFields.length === 0
+//   - submit button was found and clicked without error
+// Any deviation from that and this function is never reached.
+async function saveToRegistry(
+  platform,
+  allActions,
+  fingerprints,
+  profile,
+  jobUrl,
+  log,
+) {
+  try {
+    const fingerprintBySelector = new Map(
+      fingerprints.map((f) => [f.selector, f]),
+    );
+
+    const ops = [];
+    for (const action of allActions) {
+      // Skip anything that isn't a real fill
+      if (!action.selector) continue;
+      if (action.unanswered || action.action === "unanswered") continue;
+      if (action.action === "file" || action.action === "skip") continue;
+      if (
+        action.value === "" ||
+        action.value === null ||
+        action.value === undefined
+      )
+        continue;
+
+      const fp = fingerprintBySelector.get(action.selector);
+      const label = fp?.label || null;
+      const mapsTo = inferMapsTo(action.value, profile);
+
+      ops.push({
+        updateOne: {
+          filter: { platform, selector: action.selector },
+          update: {
+            $inc: { seenCount: 1, successCount: 1 },
+            $set: {
+              action: action.action,
+              lastSeen: new Date(),
+              lastJobUrl: jobUrl,
+              // Only overwrite label/mapsTo if we have a better value than what's stored
+              ...(label && { label }),
+              ...(mapsTo && { mapsTo }),
+            },
+            $setOnInsert: {
+              platform,
+              selector: action.selector,
+              seenCount: 0, // $inc will add 1 on top
+              successCount: 0,
+            },
+          },
+          upsert: true,
+        },
+      });
+    }
+
+    if (ops.length === 0) return;
+
+    await FieldRegistry.bulkWrite(ops, { ordered: false });
+    log(`📚 Registry: ${ops.length} selector(s) recorded.`);
+  } catch (err) {
+    // Registry errors must never crash the application agent
+    log(`⚠️  Registry write skipped: ${err.message.split("\n")[0]}`);
+  }
+}
+
 // ─── Main Agent ────────────────────────────────────────────────────────────────
 export const runApplicationAgent = async (
   job,
@@ -901,7 +1080,19 @@ export const runApplicationAgent = async (
     page = await context.newPage();
 
     const isLever = job.url.includes("jobs.lever.co");
+    // ── Navigate + grab job description text ──────────────────────────────
+    // For Lever: score BEFORE navigating to /apply — the apply page is just
+    // a form with no job description, so scoring there always returns 0.
+    let jobText = "";
     if (isLever) {
+      await page.goto(job.url, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+      await page.waitForTimeout(1500);
+      jobText = await page
+        .evaluate(() => document.body.innerText)
+        .catch(() => "");
       await openLeverForm(page, job.url, log);
     } else {
       await page.goto(job.url, {
@@ -909,13 +1100,14 @@ export const runApplicationAgent = async (
         timeout: 30000,
       });
       await page.waitForTimeout(1500);
+      jobText = await page
+        .evaluate(() => document.body.innerText)
+        .catch(() => "");
     }
 
     // ── Relevance Score ───────────────────────────────────────────────────
     log(`📊 Scoring job relevance...`);
-    const jobText = await page
-      .evaluate(() => document.body.innerText)
-      .catch(() => "");
+    // jobText already captured above before any /apply navigation
     const relevance = scoreJobRelevance(jobText, profile);
     log(`   Score: ${relevance.score}/100 — ${relevance.reason}`);
 
@@ -1047,25 +1239,41 @@ export const runApplicationAgent = async (
       return;
     }
 
-    // ── SUBMIT DISABLED FOR TESTING ────────────────────────────────────────
-    // Uncomment when ready to go live:
-    //
-    // const submitBtn = await findSubmitButton(page);
-    // if (!submitBtn) {
-    //   log(`⚠️  Submit button not found.`);
-    //   job.status = 'MANUAL_REVIEW_NEEDED';
-    //   await job.save();
-    //   await new Promise(r => setTimeout(r, 90000));
-    //   await page.close().catch(() => {});
-    //   return;
-    // }
-    // log(`🚀 Submitting...`);
-    // await submitBtn.click();
-    // await page.waitForTimeout(8000).catch(() => {});
-    // log(`✅ Submitted.`);
+    // ── SUBMIT (hard gate: only fires on 100% clean verify) ───────────────
+    // Conditions already guaranteed by the needsHuman check above:
+    //   - needsHuman === false  → no unanswered fields, no conditional fields
+    //   - mismatches.length === 0 after retry
+    // If either condition failed we returned MANUAL_REVIEW_NEEDED already.
+    log(`🔍 Verify clean — searching for submit button...`);
+    const submitBtn = await findSubmitButton(page);
 
-    log(`✅ All fields filled. Submit disabled for testing.`);
+    if (!submitBtn) {
+      log(`⚠️  Submit button not found — flagging for manual review.`);
+      job.status = "MANUAL_REVIEW_NEEDED";
+      await job.save();
+      await new Promise((r) => setTimeout(r, 90000));
+      await page.close().catch(() => {});
+      return;
+    }
+
+    log(`🚀 All fields verified — submitting application...`);
+    await submitBtn.click();
+    await page.waitForTimeout(6000).catch(() => {});
+    log(`✅ Application submitted.`);
+
+    // ── Registry: record ONLY after clean verify + successful submit ───────
+    // saveToRegistry is wrapped in try-catch internally — cannot crash here.
+    await saveToRegistry(
+      platform || "unknown",
+      allActions,
+      fingerprints,
+      profile,
+      job.url,
+      log,
+    );
+
     job.status = "APPLIED";
+    job.appliedAt = new Date();
     await job.save();
 
     await page.close().catch(() => {});

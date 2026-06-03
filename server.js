@@ -9,6 +9,7 @@ import mongoose from "mongoose";
 import { runDiscoveryAgent } from "./engines/discovery.agent.js";
 import { runApplicationAgent } from "./engines/application.agent.js";
 import { JobLead } from "./models/JobLead.js";
+import { FieldRegistry } from "./models/FieldRegistry.js";
 import { launchBrowser } from "./services/browser.manager.js";
 import fs from "fs";
 
@@ -170,6 +171,69 @@ app.delete("/api/leads/:id", async (req, res) => {
 
 app.get("/api/status", (req, res) => {
   res.json({ running: activeAgent });
+});
+
+// ─── FIELD REGISTRY ──────────────────────────────────────────────────────────
+
+// GET /api/registry — summary stats + all known selectors
+app.get("/api/registry", async (req, res) => {
+  try {
+    const { platform } = req.query; // optional filter: ?platform=greenhouse
+    const query = platform ? { platform } : {};
+    const entries = await FieldRegistry.find(query)
+      .sort({ successCount: -1, seenCount: -1 })
+      .lean();
+
+    const stats = {
+      total: entries.length,
+      byPlatform: entries.reduce((acc, e) => {
+        acc[e.platform] = (acc[e.platform] || 0) + 1;
+        return acc;
+      }, {}),
+      highConfidence: entries.filter((e) => e.successCount >= 2).length,
+    };
+
+    res.json({ stats, entries });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch registry" });
+  }
+});
+
+// DELETE /api/registry — wipe registry (useful during dev/testing)
+app.delete("/api/registry", async (req, res) => {
+  try {
+    const result = await FieldRegistry.deleteMany({});
+    res.json({ message: `Cleared ${result.deletedCount} registry entries.` });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to clear registry" });
+  }
+});
+
+// ─── OUTCOME LOOP ─────────────────────────────────────────────────────────────
+
+// POST /api/leads/:id/responded — mark a lead as responded (interview/rejection/etc.)
+// Call this manually or from a future email-scraper when a company replies.
+app.post("/api/leads/:id/responded", async (req, res) => {
+  try {
+    const { responseType } = req.body; // 'INTERVIEW' | 'REJECTION' | 'ASSESSMENT' | 'OTHER'
+    const valid = ["INTERVIEW", "REJECTION", "ASSESSMENT", "OTHER"];
+    if (responseType && !valid.includes(responseType)) {
+      return res.status(400).json({ error: `responseType must be one of: ${valid.join(", ")}` });
+    }
+    const lead = await JobLead.findByIdAndUpdate(
+      req.params.id,
+      {
+        status: "RESPONDED",
+        respondedAt: new Date(),
+        responseType: responseType || "OTHER",
+      },
+      { new: true },
+    );
+    if (!lead) return res.status(404).json({ error: "Lead not found" });
+    res.json({ message: "Lead marked as responded", lead });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update lead" });
+  }
 });
 
 const PORT = process.env.PORT || 5000;
