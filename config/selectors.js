@@ -55,13 +55,15 @@ export const GREENHOUSE_FIELDS = {
 // Greenhouse EEO / demographic selectors — these use select dropdowns.
 // Names are standard across all Greenhouse boards that enable EEO.
 export const GREENHOUSE_EEO = {
-  // The actual name attrs look like: job_application[demographic_answers_attributes][N][answer_option_ids][]
-  // We detect these by label keywords instead (deterministicMap already handles them).
-  // Listed here for documentation purposes.
+  // Matched by label text OR by selector ID (e.g. #gender, #hispanic_ethnicity)
   gender: (p) => p.gender || "Decline to self-identify",
   race: (p) => p.ethnicity || "Decline to self-identify",
+  hispanic: (p) => p.ethnicity || "Decline to self-identify",
+  hispanic_ethnicity: (p) => p.ethnicity || "Decline to self-identify",
   veteran_status: (p) => p.veteran || "I am not a protected veteran",
+  veteran: (p) => p.veteran || "I am not a protected veteran",
   disability_status: (p) => p.disability || "I don't wish to answer",
+  disability: (p) => p.disability || "I don't wish to answer",
 };
 
 // Greenhouse education field names (inside education[] arrays)

@@ -460,8 +460,28 @@ export default function App() {
       fetchLeads();
       addLog("🔄 Lead reset to DISCOVERED — will be picked up next run.");
     } catch {
-      addLog("❌ Retry failed — backend route may not exist yet.");
+      addLog("❌ Retry failed.");
     }
+  };
+
+  const retryAll = async (statuses) => {
+    try {
+      const r = await fetch(`${SERVER}/api/leads/retry/all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ statuses }),
+      });
+      const d = await r.json();
+      fetchLeads();
+      addLog(`🔄 ${d.message}`);
+    } catch {
+      addLog("❌ Retry all failed.");
+    }
+  };
+
+  const markManualDone = () => {
+    socket.emit("skip_wait");
+    addLog("✅ Marked as done — agent moving to next job.");
   };
 
   const nukeLeads = async () => {
@@ -487,6 +507,7 @@ export default function App() {
 
   const FILTERS = [
     "ALL",
+    "TODAY",
     "DISCOVERED",
     "APPLYING",
     "APPLIED",
@@ -494,8 +515,44 @@ export default function App() {
     "FAILED",
     "FAILED_NEEDS_HEALING",
   ];
+
+  const isToday = (dateStr) => {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    const now = new Date();
+    return (
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate()
+    );
+  };
+
   const filtered =
-    filter === "ALL" ? leads : leads.filter((l) => l.status === filter);
+    filter === "ALL"
+      ? leads
+      : filter === "TODAY"
+        ? leads.filter((l) => isToday(l.createdAt))
+        : leads.filter((l) => l.status === filter);
+
+  // For retry-all: which statuses are retryable in current filter
+  const retryableStatuses = [
+    "FAILED",
+    "FAILED_NEEDS_HEALING",
+    "MANUAL_REVIEW_NEEDED",
+    "CAPTCHA_BLOCKED",
+  ];
+  const showRetryAll =
+    [
+      "FAILED",
+      "FAILED_NEEDS_HEALING",
+      "MANUAL_REVIEW_NEEDED",
+      "CAPTCHA_BLOCKED",
+    ].includes(filter) ||
+    (filter !== "ALL" &&
+      filter !== "TODAY" &&
+      filter !== "DISCOVERED" &&
+      filter !== "APPLYING" &&
+      filter !== "APPLIED");
   const queue = leads.filter((l) => l.status === "DISCOVERED").slice(0, 4);
 
   return (
@@ -514,16 +571,24 @@ export default function App() {
           <div className="topbar-right">
             {!agentRunning ? (
               <>
-                {["Google", "LinkedIn", "Naukri"].map((p) => (
-                  <button
-                    key={p}
-                    className="tbtn go"
-                    onClick={() => deployAgent(p)}
-                    disabled={!profile}
-                  >
-                    ▶ {p}
-                  </button>
-                ))}
+                {["Google", "LinkedIn", "Naukri"].map((p) => {
+                  const isReady = p === "Google";
+                  return (
+                    <button
+                      key={p}
+                      className="tbtn go"
+                      onClick={() => isReady && deployAgent(p)}
+                      disabled={!profile || !isReady}
+                      title={!isReady ? `${p} engine coming soon` : undefined}
+                      style={
+                        !isReady ? { opacity: 0.35, cursor: "not-allowed" } : {}
+                      }
+                    >
+                      ▶ {p}
+                      {!isReady ? " 🔒" : ""}
+                    </button>
+                  );
+                })}
               </>
             ) : (
               <button className="tbtn stop" onClick={stopAgent}>
@@ -965,21 +1030,59 @@ export default function App() {
 
             {/* Filters */}
             <div className="filters">
-              {FILTERS.map((f) => (
-                <button
-                  key={f}
-                  className={`fbtn ${filter === f ? "active" : ""}`}
-                  onClick={() => setFilter(f)}
-                >
-                  {f.replace(/_/g, " ")}
-                  {f !== "ALL" && (
-                    <span style={{ marginLeft: 4, opacity: 0.6 }}>
-                      {leads.filter((l) => l.status === f).length}
-                    </span>
-                  )}
-                </button>
-              ))}
-              <div className="filters-right">
+              {FILTERS.map((f) => {
+                const count =
+                  f === "ALL"
+                    ? null
+                    : f === "TODAY"
+                      ? leads.filter((l) => isToday(l.createdAt)).length
+                      : leads.filter((l) => l.status === f).length;
+                return (
+                  <button
+                    key={f}
+                    className={`fbtn ${filter === f ? "active" : ""}`}
+                    onClick={() => setFilter(f)}
+                    style={
+                      f === "TODAY"
+                        ? {
+                            borderColor: "var(--gold)",
+                            color: filter === f ? undefined : "var(--gold)",
+                          }
+                        : {}
+                    }
+                  >
+                    {f === "TODAY" ? "⚡ Today" : f.replace(/_/g, " ")}
+                    {count !== null && (
+                      <span style={{ marginLeft: 4, opacity: 0.6 }}>
+                        {count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              <div
+                className="filters-right"
+                style={{ display: "flex", gap: 6, alignItems: "center" }}
+              >
+                {showRetryAll && filtered.length > 0 && (
+                  <button
+                    className="tbtn"
+                    style={{
+                      fontSize: 10,
+                      borderColor: "var(--gold)",
+                      color: "var(--gold)",
+                    }}
+                    onClick={() => retryAll(retryableStatuses)}
+                  >
+                    ⟳ Retry All (
+                    {
+                      filtered.filter((l) =>
+                        retryableStatuses.includes(l.status),
+                      ).length
+                    }
+                    )
+                  </button>
+                )}
                 <button
                   className="tbtn"
                   style={{ fontSize: 10 }}
@@ -1056,6 +1159,19 @@ export default function App() {
                         >
                           ↗ Open
                         </a>
+                        {lead.status === "MANUAL_REVIEW_NEEDED" &&
+                          agentRunning && (
+                            <button
+                              className="ic-btn"
+                              style={{
+                                borderColor: "var(--green)",
+                                color: "var(--green)",
+                              }}
+                              onClick={markManualDone}
+                            >
+                              ✓ Done
+                            </button>
+                          )}
                         {canRetry && (
                           <button
                             className="ic-btn retry"

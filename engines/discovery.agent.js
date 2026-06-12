@@ -73,14 +73,17 @@ const searchDDG = async (page, query, log) => {
       .filter((href) => href && href.startsWith("http"));
   });
 
-  return [...new Set(rawUrls.filter(isRealJobUrl))].slice(0, 10);
+  return [...new Set(rawUrls.filter(isRealJobUrl))].slice(0, 15);
 };
 
 // Extract just the country from "City, Country" — used for broader DDG searches.
 // Greenhouse/Lever are global platforms; city-level searches return almost nothing.
 const getCountryHint = (loc) => {
   if (!loc || loc === "Remote") return null;
-  const parts = loc.split(",").map((s) => s.trim()).filter(Boolean);
+  const parts = loc
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   // If only one part, it might be a country already
   return parts[parts.length - 1] || null;
 };
@@ -118,19 +121,28 @@ export const runDiscoveryAgent = async (profile, location, io) => {
     for (const title of titles) {
       const urlSet = new Set();
 
-      for (let i = 0; i < searchLocations.length; i++) {
-        const loc = searchLocations[i];
-        const query = `site:greenhouse.io OR site:lever.co ${title} ${loc}`;
-        log(`🔍 Searching: ${title} — ${loc}`);
+      // Run multiple query variants per title to get more results and avoid
+      // DDG returning the same 10 results for every search.
+      // Split greenhouse and lever into separate queries — DDG's OR operator
+      // often returns fewer results than two separate targeted searches.
+      const queryVariants = [
+        `site:job-boards.greenhouse.io ${title} software engineer`,
+        `site:jobs.lever.co ${title} developer`,
+        `site:boards.greenhouse.io OR site:job-boards.greenhouse.io "${title}" remote`,
+        `site:jobs.lever.co "${title}" remote`,
+      ];
+
+      for (let i = 0; i < queryVariants.length; i++) {
+        const query = queryVariants[i];
+        log(`🔍 Searching: ${title} — query ${i + 1}/${queryVariants.length}`);
         const urls = await searchDDG(page, query, log);
         urls.forEach((u) => urlSet.add(u));
-        if (i < searchLocations.length - 1) {
-          await randomDelay(1500, 3000);
-        }
+        // Stagger requests to avoid DDG rate-limiting
+        await randomDelay(2000, 4000);
       }
 
       const urls = [...urlSet];
-      log(`   Found ${urls.length} valid job lead(s) for "${title}"`);
+      log(`   Found ${urls.length} unique valid URL(s) for "${title}"`);
 
       for (const url of urls) {
         const exists = await JobLead.findOne({ url });

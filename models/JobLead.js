@@ -37,6 +37,12 @@ const jobLeadSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Re-queue tracking — incremented each time a MANUAL_REVIEW_NEEDED job re-queues
+    retryCount: { type: Number, default: 0 },
+
+    // True if this job was processed while DRY_RUN=true (form filled but not submitted)
+    dryRun: { type: Boolean, default: false },
+
     lastKnownHtml: { type: String, default: null },
     aiGeneratedSelector: { type: String, default: null },
 

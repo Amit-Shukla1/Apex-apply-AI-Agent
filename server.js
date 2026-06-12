@@ -12,6 +12,7 @@ import { JobLead } from "./models/JobLead.js";
 import { FieldRegistry } from "./models/FieldRegistry.js";
 import { launchBrowser } from "./services/browser.manager.js";
 import fs from "fs";
+import { waitControl } from "./services/wait.control.js";
 
 dotenv.config();
 
@@ -32,6 +33,13 @@ mongoose
 
 const upload = multer({ storage: multer.memoryStorage() });
 let activeAgent = false;
+
+io.on("connection", (socket) => {
+  // Client fires this after manually completing a form during the 90s hold
+  socket.on("skip_wait", () => {
+    waitControl.skip = true;
+  });
+});
 
 app.post("/api/upload-resume", upload.single("resume"), async (req, res) => {
   try {
@@ -160,6 +168,30 @@ app.post("/api/leads/:id/retry", async (req, res) => {
   }
 });
 
+app.post("/api/leads/retry/all", async (req, res) => {
+  try {
+    const { statuses } = req.body; // e.g. ["FAILED","MANUAL_REVIEW_NEEDED"]
+    const filter = statuses?.length
+      ? { status: { $in: statuses } }
+      : {
+          status: {
+            $in: [
+              "FAILED",
+              "FAILED_NEEDS_HEALING",
+              "MANUAL_REVIEW_NEEDED",
+              "CAPTCHA_BLOCKED",
+            ],
+          },
+        };
+    const result = await JobLead.updateMany(filter, {
+      $set: { status: "DISCOVERED", skipReason: null, retryCount: 0 },
+    });
+    res.json({ message: `Reset ${result.modifiedCount} leads to DISCOVERED` });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to retry all leads" });
+  }
+});
+
 app.delete("/api/leads/:id", async (req, res) => {
   try {
     await JobLead.findByIdAndDelete(req.params.id);
@@ -218,7 +250,9 @@ app.post("/api/leads/:id/responded", async (req, res) => {
     const { responseType } = req.body; // 'INTERVIEW' | 'REJECTION' | 'ASSESSMENT' | 'OTHER'
     const valid = ["INTERVIEW", "REJECTION", "ASSESSMENT", "OTHER"];
     if (responseType && !valid.includes(responseType)) {
-      return res.status(400).json({ error: `responseType must be one of: ${valid.join(", ")}` });
+      return res
+        .status(400)
+        .json({ error: `responseType must be one of: ${valid.join(", ")}` });
     }
     const lead = await JobLead.findByIdAndUpdate(
       req.params.id,

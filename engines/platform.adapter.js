@@ -60,12 +60,21 @@ function buildGreenhouseActions(fingerprints, profile, log) {
   }
 
   // Map EEO fields by label keyword (name attrs are dynamic IDs)
+  // NOTE: fp.type is "select-one" (from el.type) not "select" — use startsWith
   for (const fp of fingerprints) {
-    if (fp.type !== "select" || handled.has(fp.selector)) continue;
+    if (!fp.type.startsWith("select") || handled.has(fp.selector)) continue;
     const label = (fp.label || "").toLowerCase();
 
     for (const [key, resolver] of Object.entries(GREENHOUSE_EEO)) {
-      if (label.includes(key.replace("_", " ")) || label.includes(key)) {
+      const keyNorm = key.replace("_", " ");
+      // Match by label text OR by selector ID (e.g. #gender, #veteran_status)
+      const selectorId = (fp.selector || "").replace("#", "").toLowerCase();
+      if (
+        label.includes(keyNorm) ||
+        label.includes(key) ||
+        selectorId === key ||
+        selectorId.includes(keyNorm)
+      ) {
         const value = resolver(profile);
         if (value) {
           actions.push({ selector: fp.selector, action: "select", value });
