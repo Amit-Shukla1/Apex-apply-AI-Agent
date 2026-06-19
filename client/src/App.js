@@ -160,8 +160,9 @@ const css = `
   .btn-stop:hover { background: rgba(255,69,96,.15); }
 
   /* Stats */
-  .stats-strip { display: grid; grid-template-columns: repeat(6,1fr); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-  .stat { background: var(--panel); padding: 10px 14px; }
+  .stats-strip { display: flex; flex-wrap: wrap; background: var(--panel); border-bottom: 1px solid var(--border); flex-shrink: 0; align-items: flex-end; padding: 10px 14px; gap: 0; }
+  .stat { padding: 4px 14px 4px 0; min-width: 80px; }
+  .stats-strip-label { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 6px; }
   .stat-val { font-size: 22px; font-weight: 800; line-height: 1; }
   .stat-lbl { font-family: var(--mono); font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-top: 3px; }
 
@@ -225,7 +226,7 @@ export default function App() {
   ]);
   const [agentRunning, setAgentRunning] = useState(false);
   const [lastPlatform, setLastPlatform] = useState(null);
-  const [filter, setFilter] = useState("ALL");
+  const [filter, setFilter] = useState("TODAY");
   const [uploading, setUploading] = useState(false);
   const [logOpen, setLogOpen] = useState(true);
   const [profileExpanded, setProfileExpanded] = useState(false);
@@ -491,6 +492,17 @@ export default function App() {
     addLog("🗑️ All leads cleared.");
   };
 
+  const isToday = (dateStr) => {
+    if (!dateStr) return false;
+    const d = new Date(dateStr);
+    const now = new Date();
+    return (
+      d.getFullYear() === now.getFullYear() &&
+      d.getMonth() === now.getMonth() &&
+      d.getDate() === now.getDate()
+    );
+  };
+
   const total = leads.length;
   const applied = leads.filter((l) => l.status === "APPLIED").length;
   const pending = leads.filter((l) => l.status === "DISCOVERED").length;
@@ -505,9 +517,26 @@ export default function App() {
   ).length;
   const rate = total > 0 ? Math.round((applied / total) * 100) : 0;
 
+  // ── Today-only stats ────────────────────────────────────────────────────
+  const todayLeads = leads.filter((l) => isToday(l.createdAt));
+  const todayTotal = todayLeads.length;
+  const todayApplied = todayLeads.filter((l) => l.status === "APPLIED").length;
+  const todayPending = todayLeads.filter(
+    (l) => l.status === "DISCOVERED",
+  ).length;
+  const todayManual = todayLeads.filter(
+    (l) => l.status === "MANUAL_REVIEW_NEEDED",
+  ).length;
+  const todayFailed = todayLeads.filter((l) =>
+    ["FAILED", "CAPTCHA_BLOCKED", "FAILED_NEEDS_HEALING"].includes(l.status),
+  ).length;
+  const todayRate =
+    todayTotal > 0 ? Math.round((todayApplied / todayTotal) * 100) : 0;
+
   const FILTERS = [
-    "ALL",
     "TODAY",
+    "HISTORY",
+    "ALL",
     "DISCOVERED",
     "APPLYING",
     "APPLIED",
@@ -516,23 +545,14 @@ export default function App() {
     "FAILED_NEEDS_HEALING",
   ];
 
-  const isToday = (dateStr) => {
-    if (!dateStr) return false;
-    const d = new Date(dateStr);
-    const now = new Date();
-    return (
-      d.getFullYear() === now.getFullYear() &&
-      d.getMonth() === now.getMonth() &&
-      d.getDate() === now.getDate()
-    );
-  };
-
   const filtered =
     filter === "ALL"
       ? leads
       : filter === "TODAY"
         ? leads.filter((l) => isToday(l.createdAt))
-        : leads.filter((l) => l.status === filter);
+        : filter === "HISTORY"
+          ? leads.filter((l) => !isToday(l.createdAt))
+          : leads.filter((l) => l.status === filter);
 
   // For retry-all: which statuses are retryable in current filter
   const retryableStatuses = [
@@ -550,6 +570,7 @@ export default function App() {
     ].includes(filter) ||
     (filter !== "ALL" &&
       filter !== "TODAY" &&
+      filter !== "HISTORY" &&
       filter !== "DISCOVERED" &&
       filter !== "APPLYING" &&
       filter !== "APPLIED");
@@ -1002,21 +1023,118 @@ export default function App() {
 
           {/* ── MAIN ── */}
           <main className="main">
-            {/* Stats */}
-            <div className="stats-strip">
+            {/* ── TODAY Stats ── */}
+            <div
+              className="stats-strip"
+              style={{
+                borderBottom: "1px solid var(--border)",
+                paddingBottom: 12,
+                marginBottom: 0,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  marginBottom: 8,
+                  width: "100%",
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 9,
+                    letterSpacing: ".15em",
+                    color: "var(--gold)",
+                    fontWeight: 700,
+                  }}
+                >
+                  ⚡ TODAY
+                </span>
+                <div
+                  style={{
+                    flex: 1,
+                    height: 1,
+                    background: "rgba(232,184,75,0.2)",
+                  }}
+                />
+              </div>
+              {[
+                { val: fmt(todayTotal), lbl: "Found", color: "var(--text)" },
+                {
+                  val: fmt(todayApplied),
+                  lbl: "Applied",
+                  color: "var(--green)",
+                },
+                {
+                  val: fmt(todayPending),
+                  lbl: "Pending",
+                  color: "var(--blue)",
+                },
+                { val: fmt(todayManual), lbl: "Review", color: "#f97316" },
+                { val: fmt(todayFailed), lbl: "Failed", color: "var(--red)" },
+                { val: `${todayRate}%`, lbl: "Rate", color: "var(--gold)" },
+              ].map((s) => (
+                <div className="stat" key={"t-" + s.lbl}>
+                  <div
+                    className="stat-val"
+                    style={{ color: s.color, fontSize: 22 }}
+                  >
+                    {s.val}
+                  </div>
+                  <div className="stat-lbl">{s.lbl}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* ── ALL TIME Stats ── */}
+            <div
+              className="stats-strip"
+              style={{ paddingTop: 10, marginBottom: 4, opacity: 0.55 }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  marginBottom: 8,
+                  width: "100%",
+                }}
+              >
+                <span
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 9,
+                    letterSpacing: ".15em",
+                    color: "var(--muted2)",
+                    fontWeight: 700,
+                  }}
+                >
+                  ALL TIME
+                </span>
+                <div
+                  style={{ flex: 1, height: 1, background: "var(--border)" }}
+                />
+              </div>
               {[
                 { val: fmt(total), lbl: "Total", color: "var(--text)" },
                 { val: fmt(applied), lbl: "Applied", color: "var(--green)" },
                 { val: fmt(pending), lbl: "Pending", color: "var(--blue)" },
                 { val: fmt(manual), lbl: "Review", color: "#f97316" },
                 { val: fmt(failed), lbl: "Failed", color: "var(--red)" },
-                { val: `${rate}%`, lbl: "Apply rate", color: "var(--gold)" },
+                { val: `${rate}%`, lbl: "Rate", color: "var(--gold)" },
               ].map((s) => (
-                <div className="stat" key={s.lbl}>
-                  <div className="stat-val" style={{ color: s.color }}>
+                <div className="stat" key={"a-" + s.lbl}>
+                  <div
+                    className="stat-val"
+                    style={{ color: s.color, fontSize: 16 }}
+                  >
                     {s.val}
                   </div>
-                  <div className="stat-lbl">{s.lbl}</div>
+                  <div className="stat-lbl" style={{ fontSize: 9 }}>
+                    {s.lbl}
+                  </div>
                 </div>
               ))}
             </div>
@@ -1033,10 +1151,12 @@ export default function App() {
               {FILTERS.map((f) => {
                 const count =
                   f === "ALL"
-                    ? null
+                    ? leads.length
                     : f === "TODAY"
-                      ? leads.filter((l) => isToday(l.createdAt)).length
-                      : leads.filter((l) => l.status === f).length;
+                      ? todayTotal
+                      : f === "HISTORY"
+                        ? leads.filter((l) => !isToday(l.createdAt)).length
+                        : leads.filter((l) => l.status === f).length;
                 return (
                   <button
                     key={f}
@@ -1048,10 +1168,19 @@ export default function App() {
                             borderColor: "var(--gold)",
                             color: filter === f ? undefined : "var(--gold)",
                           }
-                        : {}
+                        : f === "HISTORY"
+                          ? {
+                              borderColor: "var(--muted2)",
+                              color: filter === f ? undefined : "var(--muted2)",
+                            }
+                          : {}
                     }
                   >
-                    {f === "TODAY" ? "⚡ Today" : f.replace(/_/g, " ")}
+                    {f === "TODAY"
+                      ? "⚡ Today"
+                      : f === "HISTORY"
+                        ? "🕓 History"
+                        : f.replace(/_/g, " ")}
                     {count !== null && (
                       <span style={{ marginLeft: 4, opacity: 0.6 }}>
                         {count}

@@ -535,15 +535,44 @@ function deterministicMap(fingerprints, profile) {
       actionType = "select";
     } else if (
       /how.*hear|source|referral|where.*find/.test(c) &&
-      t.startsWith("select")
+      t !== "checkbox" &&
+      t !== "radio"
     ) {
       value = "LinkedIn";
-      actionType = "select";
+      actionType = t.startsWith("select") ? "select" : "fill";
+    }
+
+    // ── Checkbox handler ────────────────────────────────────────────────────
+    // Must run AFTER all other checks so value is still null for unmatched checkboxes
+    if (value === null && t === "checkbox") {
+      const lbl = `${f.label} ${f.hint} ${c}`.toLowerCase();
+      const candidateSkills = (profile.skills || []).map((s) =>
+        s.toLowerCase(),
+      );
+      // Check if label matches any skill the candidate has
+      const skillMatch = candidateSkills.some((sk) => {
+        const skCore = sk.replace(/[.\s]/g, ""); // "react.js" → "reactjs"
+        return lbl.includes(sk) || lbl.replace(/[.\s]/g, "").includes(skCore);
+      });
+      // General "frontend / backend / fullstack" area checkboxes
+      const areaMatch =
+        /front[- ]?end|backend|back[- ]?end|full[- ]?stack|node|javascript|react/i.test(
+          lbl,
+        ) &&
+        candidateSkills.some((sk) => /front|back|node|react|js|full/i.test(sk));
+      // Terms / consent checkboxes — always tick
+      const isTerms =
+        /terms|condition|authoriz|consent|certif|confirm|agree|acknowledge|privacy/i.test(
+          lbl,
+        );
+      if (skillMatch || areaMatch || isTerms) {
+        value = true;
+        actionType = "check";
+      }
     }
 
     if (value !== null && value !== "") {
-      actions.push({ selector: f.selector, action: actionType, value });
-      // Phone fields: also set the intl-tel-input country dropdown to India.
+      // Phone fields: set country dropdown BEFORE typing the number
       if (/\bphone\b|\bmobile\b|\btel\b/.test(c)) {
         actions.push({
           selector: f.selector,
@@ -551,6 +580,7 @@ function deterministicMap(fingerprints, profile) {
           value: "in",
         });
       }
+      actions.push({ selector: f.selector, action: actionType, value });
     } else {
       unmatched.push(f);
     }
@@ -765,7 +795,17 @@ async function mapFieldsWithGroq(fingerprints, profile, log, jobText = "") {
       log(
         `   🧹 Chunk ${i + 1}: filtered ${filtered} hallucinated selector(s).`,
       );
-    allActions.push(...valid);
+
+    // Deduplicate — Groq sometimes emits multiple actions for the same selector.
+    // Keep only the last one (Groq tends to refine answers toward the end).
+    const dedupMap = new Map();
+    for (const a of valid) dedupMap.set(a.selector, a);
+    const deduped = [...dedupMap.values()];
+    if (deduped.length < valid.length)
+      log(
+        `   🧹 Chunk ${i + 1}: collapsed ${valid.length - deduped.length} duplicate selector(s).`,
+      );
+    allActions.push(...deduped);
   }
 
   log(
@@ -846,11 +886,10 @@ async function executeActions(page, actions, log) {
           // 1. Exact label match
           // 2. Case-insensitive match
           // 3. Neutral-keyword fallback for EEO/optional fields
-          //    ("decline", "prefer not", "wish to answer", "self-identify", etc.)
           const target = String(action.value).toLowerCase().trim();
           const options = await page.evaluate((sel) => {
             const el = document.querySelector(sel);
-            if (!el) return [];
+            if (!el || !el.options) return [];
             return Array.from(el.options).map((o) => ({
               value: o.value,
               text: o.text.trim(),
@@ -867,11 +906,16 @@ async function executeActions(page, actions, log) {
           // Tier 2: case-insensitive
           if (!match)
             match = options.find((o) => o.text.toLowerCase() === target);
-          // Tier 3: partial keyword match (handles "Decline to Self-Identify" vs "Decline to self-identify")
-          if (!match)
-            match = options.find((o) =>
-              o.text.toLowerCase().includes(target.split(" ")[0]),
-            );
+          // Tier 3: partial keyword match — skip if first word is too short (e.g. "I")
+          // to avoid false-matching every option that contains the letter "i"
+          if (!match) {
+            const firstWord = target.split(" ")[0];
+            if (firstWord.length >= 3) {
+              match = options.find((o) =>
+                o.text.toLowerCase().includes(firstWord),
+              );
+            }
+          }
           // Tier 4: neutral fallback — for EEO/optional fields, find "safe" option
           if (!match) {
             const NEUTRAL = [
@@ -922,8 +966,10 @@ async function executeActions(page, actions, log) {
               );
               if (indiaOpt) {
                 await indiaOpt.click();
+                await page.waitForTimeout(150);
+                // Force-close the dropdown — if still open, phone fill will type into search box
+                await page.keyboard.press("Escape");
               } else {
-                // Close dropdown if no India option found
                 await page.keyboard.press("Escape");
               }
               await page.waitForTimeout(200);
@@ -1093,8 +1139,26 @@ async function verifyFill(page, actions, originalFingerprints, log) {
               break;
             }
             const selected = el.options[el.selectedIndex]?.text?.trim() ?? "";
+            const NEUTRAL_KW = [
+              "decline",
+              "prefer not",
+              "self-identify",
+              "wish to answer",
+              "rather not",
+              "no response",
+              "choose not",
+              "not disclosed",
+            ];
+            const isNeutralExpected = NEUTRAL_KW.some((kw) =>
+              String(action.value).toLowerCase().includes(kw),
+            );
+            const isNeutralActual = NEUTRAL_KW.some((kw) =>
+              selected.toLowerCase().includes(kw),
+            );
+            // OK if exact match OR both sides are "decline" equivalents
             const match =
-              selected.toLowerCase() === String(action.value).toLowerCase();
+              selected.toLowerCase() === String(action.value).toLowerCase() ||
+              (isNeutralExpected && isNeutralActual);
             results.push({
               ...action,
               status: match ? "OK" : "MISMATCH",
@@ -1471,6 +1535,30 @@ export const runApplicationAgent = async (
     job.status = "ANALYZING_FORM";
     await job.save();
 
+    // ── CAPTCHA early detection ────────────────────────────────────────────
+    // Check before fingerprinting so we don't waste time filling then failing
+    const hasCaptcha = await page.evaluate(() => {
+      const bodyText = document.body?.innerText?.toLowerCase() || "";
+      const hasCaptchaFrame = !!document.querySelector(
+        'iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], ' +
+          ".h-captcha, .g-recaptcha, [data-sitekey], #challenge-form",
+      );
+      const hasCaptchaText =
+        bodyText.includes("verify you are human") ||
+        bodyText.includes("select all images") ||
+        bodyText.includes("match the shapes") ||
+        bodyText.includes("i'm not a robot") ||
+        bodyText.includes("security check");
+      return hasCaptchaFrame || hasCaptchaText;
+    });
+    if (hasCaptcha) {
+      log(`🤖 CAPTCHA detected — marking CAPTCHA_BLOCKED and skipping.`);
+      job.status = "CAPTCHA_BLOCKED";
+      await job.save();
+      await page.close().catch(() => {});
+      return;
+    }
+
     // ── DOM Fingerprinting ─────────────────────────────────────────────────
     log(`🔬 Fingerprinting DOM...`);
     const fingerprints = await page.evaluate(FINGERPRINT_FN);
@@ -1589,6 +1677,7 @@ export const runApplicationAgent = async (
     );
 
     // ── Retry mismatches once ──────────────────────────────────────────────
+    let finalMismatches = [];
     if (mismatches.length > 0) {
       log(`🔄 Retrying ${mismatches.length} mismatch(es)...`);
       await executeActions(page, mismatches, log);
@@ -1598,8 +1687,12 @@ export const runApplicationAgent = async (
         fingerprints,
         log,
       );
-      if (stillBroken.length > 0) {
-        log(`⚠️  ${stillBroken.length} field(s) still wrong after retry.`);
+      // Deduplicate by selector — pronouns cascade (20x same selector) counts as 1
+      finalMismatches = [
+        ...new Map(stillBroken.map((m) => [m.selector, m])).values(),
+      ];
+      if (finalMismatches.length > 0) {
+        log(`⚠️  ${finalMismatches.length} field(s) still wrong after retry.`);
         needsHuman = true;
       } else {
         log(`✅ All mismatches resolved on retry.`);
@@ -1612,15 +1705,19 @@ export const runApplicationAgent = async (
     }
 
     // ── Only block on REQUIRED unmapped/mismatched fields ────────────────
-    // Optional unanswered fields should not hold up the whole submission.
+    // EEO fields (gender/race/veteran/pronouns) and Lever card fields are
+    // never truly required for submission — exclude them from the blocker check.
+    const EEO_OR_CARD =
+      /eeo\[|pronouns|\/gender|#gender|\/race|#race|veteran|disability|cards\[/i;
     const requiredUnmapped = fingerprints.filter(
       (f) => f.required && !allActions.some((a) => a.selector === f.selector),
     );
-    const requiredMismatches = (mismatches || []).filter((m) => {
+    const requiredMismatches = finalMismatches.filter((m) => {
+      if (EEO_OR_CARD.test(m.selector)) return false;
       const fp = fingerprints.find((f) => f.selector === m.selector);
       return fp?.required;
     });
-    // Override needsHuman — only true if REQUIRED fields are actually broken
+    // Override needsHuman — only true if REQUIRED non-EEO fields are broken
     if (
       needsHuman &&
       requiredUnmapped.length === 0 &&
@@ -1645,13 +1742,47 @@ export const runApplicationAgent = async (
       // Poll every second — resolves immediately when user clicks "Done" in UI,
       // or after 90s hard timeout.
       const waitStart = Date.now();
+      let userClickedDone = false;
       while (Date.now() - waitStart < 90000) {
         if (waitControl.skip) {
           waitControl.skip = false; // reset for next job
+          userClickedDone = true;
           log("✅ Manual review marked done — moving to next job.");
           break;
         }
         await new Promise((r) => setTimeout(r, 1000));
+      }
+
+      // ── Learn from manual corrections ─────────────────────────────────
+      // Re-verify what's now on the page and save any correctly-filled fields
+      // to the registry — so next time this form is seen, we skip AI for them.
+      if (userClickedDone && platform) {
+        try {
+          const { mismatches: afterManual } = await verifyFill(
+            page,
+            allActions,
+            fingerprints,
+            log,
+          );
+          const cleanActions = allActions.filter(
+            (a) => !afterManual.some((m) => m.selector === a.selector),
+          );
+          if (cleanActions.length > 0) {
+            await saveToRegistry(
+              platform,
+              cleanActions,
+              fingerprints,
+              profile,
+              job.url,
+              log,
+            );
+            log(
+              `📚 Registry: learned ${cleanActions.length} field(s) from manual correction.`,
+            );
+          }
+        } catch (e) {
+          log(`⚠️  Registry learn-from-manual skipped: ${e.message}`);
+        }
       }
       await page.close().catch(() => {});
       // Re-queue: reset to DISCOVERED so orchestrator picks it up next run.
