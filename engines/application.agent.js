@@ -3,20 +3,26 @@ import { waitControl } from "../services/wait.control.js";
 import { detectPlatform, platformMap } from "./platform.adapter.js";
 import { FieldRegistry } from "../models/FieldRegistry.js";
 import dotenv from "dotenv";
+
+// ── Shared human-wait helper ────────────────────────────────────────────────
+async function waitForHuman(ms, doneMessage, log) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (waitControl.skip) {
+      waitControl.skip = false;
+      if (doneMessage) log(doneMessage);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
 dotenv.config();
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.1-8b-instant";
+const GROQ_MODEL = "openai/gpt-oss-20b";
 const CHUNK_SIZE = 15;
 
-// ── SAFETY: Dry-run mode ────────────────────────────────────────────────────
-// While set to true, the agent fills + verifies forms but does NOT click the
-// real submit button and does NOT mark jobs as APPLIED. Set DRY_RUN=false in
-// .env (or remove this override) once field accuracy has been verified across
-// several runs. This prevents real applications going out with wrong data.
-const DRY_RUN = process.env.DRY_RUN !== "false"; // defaults to true (safe)
-
-// ─── DOM Fingerprinting ────────────────────────────────────────────────────────
 const FINGERPRINT_FN = () => {
   const getLabelText = (el) => {
     if (el.id) {
@@ -57,14 +63,11 @@ const FINGERPRINT_FN = () => {
       if (legend) return legend.innerText.trim();
     }
     let node = el.parentElement;
-    // Walk 12 levels (was 6) — Lever puts question text in grandparent <p> tags,
-    // not in a sibling or immediate parent heading.
     for (let i = 0; i < 12 && node; i++) {
       const heading = node.querySelector(
         ":scope > h1,:scope > h2,:scope > h3,:scope > h4,:scope > h5",
       );
       if (heading) return heading.innerText.trim();
-      // Lever custom card fields: question is a bare <p> or <span> in an ancestor
       const para = node.querySelector(":scope > p, :scope > span");
       if (para) {
         const t = para.innerText.trim();
@@ -76,15 +79,14 @@ const FINGERPRINT_FN = () => {
   };
 
   const bestSelector = (el) => {
-    // Prefer [name=] over #id for numeric IDs — CSS.escape turns "864" into
-    // "\38 64" which Playwright can't always resolve in page.fill/click.
-    // Pure numeric IDs are Greenhouse custom question fields.
     if (el.name) return `[name="${el.name}"]`;
     if (el.id && /^\d/.test(el.id)) {
-      // Numeric ID — use attribute selector instead of CSS-escaped #id
       return `[id="${el.id}"]`;
     }
     if (el.id) return `#${CSS.escape(el.id)}`;
+    const automationId = el.getAttribute("data-automation-id");
+    if (automationId)
+      return `[data-automation-id="${CSS.escape(automationId)}"]`;
     return null;
   };
 
@@ -178,13 +180,10 @@ const FINGERPRINT_FN = () => {
   return fingerprints;
 };
 
-// ─── Phase 1: Deterministic Label Matcher ─────────────────────────────────────
-// Covers ~80% of fields with zero AI calls. Only unmatched fields go to Groq.
 function deterministicMap(fingerprints, profile) {
   const actions = [];
   const unmatched = [];
 
-  // Extract first/last name from full name if separate fields not in profile
   const nameParts = (profile.name || "").trim().split(/\s+/);
   const firstName = profile.firstName || nameParts[0] || "";
   const lastName = profile.lastName || nameParts.slice(1).join(" ") || "";
@@ -203,12 +202,6 @@ function deterministicMap(fingerprints, profile) {
     let value = null;
     let actionType = "fill";
 
-    // ── Name ──────────────────────────────────────────────────────────────
-    // IMPORTANT: \bname\b is too broad on its own — matches #school_name,
-    // #company_name, #reference_name, #emergency_contact_name, etc. (selector
-    // text is included in `c`). Exclude any field whose label/selector also
-    // mentions a non-candidate entity (school, company, reference, employer,
-    // contact, university, college, manager, supervisor, emergency).
     const NOT_CANDIDATE_NAME =
       /school|college|university|institut|company|employer|organi[sz]ation|reference|emergency|contact|manager|supervisor|recruiter|referr/;
 
@@ -228,22 +221,14 @@ function deterministicMap(fingerprints, profile) {
       !t.startsWith("select")
     ) {
       value = profile.name || `${firstName} ${lastName}`.trim();
-    }
-
-    // ── Contact ───────────────────────────────────────────────────────────
-    else if (/\bemail\b/.test(c)) {
+    } else if (/\bemail\b/.test(c)) {
       value = profile.email || "";
     } else if (/\bphone\b|\bmobile\b|\btel\b/.test(c)) {
-      // Strip country code — form fields typically want local number only.
-      // e.g. "+91 98765 43210" → "9876543210", "+1 555 123 4567" → "5551234567"
       const rawPhone = (profile.phone || "").replace(/[\s\-()]/g, "");
       const localPhone =
         rawPhone.replace(/^\+?\d{1,2}(?=\d{10}$)/, "") || rawPhone;
       value = localPhone;
-    }
-
-    // ── Location ──────────────────────────────────────────────────────────
-    else if (
+    } else if (
       /\bcity\b|candidate[\s-]?location|current[\s-]?location|location[\s-]?input/.test(
         c,
       )
@@ -252,10 +237,7 @@ function deterministicMap(fingerprints, profile) {
     } else if (/\bcountry\b/.test(c)) {
       value = country;
       actionType = t.startsWith("select") ? "select" : "autocomplete";
-    }
-
-    // ── URLs ──────────────────────────────────────────────────────────────
-    else if (/linkedin/.test(c)) {
+    } else if (/linkedin/.test(c)) {
       value = profile.linkedinUrl || "";
     } else if (/github/.test(c)) {
       value = profile.githubUrl || "";
@@ -267,10 +249,7 @@ function deterministicMap(fingerprints, profile) {
       )
     ) {
       value = profile.portfolioUrl || profile.websiteUrl || "";
-    }
-
-    // ── Professional ──────────────────────────────────────────────────────
-    else if (
+    } else if (
       /current[\s-]?company|employer|company[\s-]?name|\borg\b/.test(c) &&
       !/how|hear/.test(c)
     ) {
@@ -281,7 +260,6 @@ function deterministicMap(fingerprints, profile) {
     ) {
       value = profile.currentTitle || "";
     } else if (/years.*exp|experience.*year/.test(c)) {
-      // If it's a radio group, pick the matching option; otherwise fill
       if (t === "radio" && f.options?.length) {
         const yrs = parseInt(profile.yearsOfExperience) || 0;
         const match = f.options.find((o) => {
@@ -293,9 +271,6 @@ function deterministicMap(fingerprints, profile) {
       } else {
         value = String(profile.yearsOfExperience || "");
       }
-
-      // ── Yes/No skill questions ("Have you worked with X?" / "Do you know Y?") ──
-      // Radio groups with exactly 2 options: yes/no — answer from profile.skills[]
     } else if (
       t === "radio" &&
       Array.isArray(f.options) &&
@@ -332,8 +307,6 @@ function deterministicMap(fingerprints, profile) {
           ? "Yes"
           : "No";
       actionType = "radio";
-
-      // ── CTC / Salary ──────────────────────────────────────────────────────
     } else if (
       /current.*ctc|current.*salary|current.*pay|present.*salary/i.test(c)
     ) {
@@ -352,8 +325,6 @@ function deterministicMap(fingerprints, profile) {
           profile.minSalary ||
           "",
       );
-
-      // ── Notice period ─────────────────────────────────────────────────────
     } else if (
       /notice.*period|notice|join.*immediately|available.*join|start.*date/i.test(
         c,
@@ -371,8 +342,6 @@ function deterministicMap(fingerprints, profile) {
           ? String(f.options[0].value || f.options[0])
           : "";
       actionType = "select";
-
-      // ── Current location (free text, not autocomplete) ────────────────────
     } else if (
       /current.*location|current.*city|current.*address|where.*based|where.*located/i.test(
         c,
@@ -381,8 +350,6 @@ function deterministicMap(fingerprints, profile) {
       !t.startsWith("select")
     ) {
       value = profile.location || "";
-
-      // ── Company interest / "What do you know about X" ─────────────────────
     } else if (
       /what.*know.*about|why.*interested.*join|why.*want.*join|why.*company|tell.*about.*us|about.*our.*company/i.test(
         c,
@@ -392,8 +359,6 @@ function deterministicMap(fingerprints, profile) {
         profile.companyInterest ||
         profile.whyHireYou ||
         `I'm excited about this opportunity as it aligns with my background in ${(profile.skills || []).slice(0, 3).join(", ")}. I believe I can contribute meaningfully to the team.`;
-
-      // ── Motivation / why hire you ─────────────────────────────────────────
     } else if (
       /why.*hire|why.*good.*fit|why.*apply|why.*interest|why.*role|why.*position|what.*motivat|why.*want/i.test(
         c,
@@ -402,8 +367,6 @@ function deterministicMap(fingerprints, profile) {
       !t.startsWith("select")
     ) {
       value = profile.whyHireYou || profile.summary || "";
-
-      // ── Proficiency / rating ──────────────────────────────────────────────
     } else if (
       /proficien|fluent|english.*level|language.*level|rate.*yourself|communication|skill.*level/i.test(
         c,
@@ -446,14 +409,10 @@ function deterministicMap(fingerprints, profile) {
       /min|expect|desired/.test(c)
     ) {
       value = String(profile.minSalary || "");
-    }
-
-    // ── Education ─────────────────────────────────────────────────────────
-    else if (/\bschool\b|university|college|institution/.test(c)) {
+    } else if (/\bschool\b|university|college|institution/.test(c)) {
       value =
         profile.educationSchool ||
         (profile.education || "").split(",")[0].trim();
-      // Greenhouse school_name_id is a typeahead/autocomplete, not a free-text input
       if (t.startsWith("select") || f.selector.includes("school_name")) {
         actionType = "autocomplete";
       }
@@ -474,10 +433,7 @@ function deterministicMap(fingerprints, profile) {
       actionType = "select";
     } else if (/relocate|willing.*move|open.*reloc/.test(c)) {
       value = profile.willingToRelocate || "No";
-    }
-
-    // ── Pronouns — always "Prefer not to say" or first neutral option ─────
-    else if (/\bpronoun/i.test(c)) {
+    } else if (/\bpronoun/i.test(c)) {
       if (t === "radio") {
         const neutralOpt =
           (f.options || []).find((o) =>
@@ -490,8 +446,6 @@ function deterministicMap(fingerprints, profile) {
       } else {
         value = profile.pronouns || "Prefer not to say";
       }
-
-      // ── Work Auth / EEO ───────────────────────────────────────────────────
     } else if (
       /work[\s-]?auth|authorized|legally[\s-]?eligible|permission.*work|right.*work/.test(
         c,
@@ -542,25 +496,22 @@ function deterministicMap(fingerprints, profile) {
       actionType = t.startsWith("select") ? "select" : "fill";
     }
 
-    // ── Checkbox handler ────────────────────────────────────────────────────
-    // Must run AFTER all other checks so value is still null for unmatched checkboxes
     if (value === null && t === "checkbox") {
       const lbl = `${f.label} ${f.hint} ${c}`.toLowerCase();
       const candidateSkills = (profile.skills || []).map((s) =>
         s.toLowerCase(),
       );
-      // Check if label matches any skill the candidate has
       const skillMatch = candidateSkills.some((sk) => {
-        const skCore = sk.replace(/[.\s]/g, ""); // "react.js" → "reactjs"
+        const skCore = sk.replace(/[.\s]/g, "");
         return lbl.includes(sk) || lbl.replace(/[.\s]/g, "").includes(skCore);
       });
-      // General "frontend / backend / fullstack" area checkboxes
-      const areaMatch =
-        /front[- ]?end|backend|back[- ]?end|full[- ]?stack|node|javascript|react/i.test(
-          lbl,
-        ) &&
-        candidateSkills.some((sk) => /front|back|node|react|js|full/i.test(sk));
-      // Terms / consent checkboxes — always tick
+      const labelWords = lbl
+        .split(/[^a-z0-9+#.]+/i)
+        .filter((w) => w.length >= 3);
+      const areaMatch = candidateSkills.some((sk) => {
+        const skWords = sk.split(/[^a-z0-9+#.]+/i).filter((w) => w.length >= 3);
+        return skWords.some((w) => labelWords.includes(w));
+      });
       const isTerms =
         /terms|condition|authoriz|consent|certif|confirm|agree|acknowledge|privacy/i.test(
           lbl,
@@ -572,7 +523,6 @@ function deterministicMap(fingerprints, profile) {
     }
 
     if (value !== null && value !== "") {
-      // Phone fields: set country dropdown BEFORE typing the number
       if (/\bphone\b|\bmobile\b|\btel\b/.test(c)) {
         actions.push({
           selector: f.selector,
@@ -589,7 +539,6 @@ function deterministicMap(fingerprints, profile) {
   return { actions, unmatched };
 }
 
-// ─── JSON repair ───────────────────────────────────────────────────────────────
 function repairJSON(raw) {
   try {
     return JSON.parse(raw);
@@ -606,7 +555,6 @@ function repairJSON(raw) {
   }
 }
 
-// ─── Groq call with 429 retry ──────────────────────────────────────────────────
 async function callGroq(payload, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch(GROQ_URL, {
@@ -635,10 +583,6 @@ async function callGroq(payload, retries = 3) {
 function compressForGroq(fingerprints) {
   return fingerprints.map((f) => {
     const c = { s: f.selector, l: f.label, t: f.type, r: f.required };
-    // Include hint, placeholder, and section context.
-    // These are critical for #question_XXXXX selectors (Greenhouse custom
-    // questions) where the selector ID carries no semantic meaning — Groq
-    // needs the surrounding text to understand what is being asked.
     if (f.hint) c.h = f.hint;
     if (f.placeholder) c.p = f.placeholder;
     if (f.context) c.ctx = f.context;
@@ -652,7 +596,6 @@ function compressForGroq(fingerprints) {
   });
 }
 
-// ─── Groq: map a single chunk (only unmatched fields) ─────────────────────────
 async function mapChunkWithGroq(
   chunk,
   profile,
@@ -673,7 +616,6 @@ async function mapChunkWithGroq(
       profile.location ||
       "",
     city: (profile.location || "").split(",")[0].trim() || "",
-    // Descriptive answer fallbacks — used by Groq for open-ended questions
     whyHireYou:
       profile.whyHireYou ||
       `I am a ${role0} with ${expYears} years of experience in ${skills3}. I am highly motivated, a quick learner, and passionate about building reliable software.`,
@@ -761,7 +703,6 @@ CRITICAL RULES:
   }
 }
 
-// ─── Chunked Groq mapping (only for fields deterministic mapper missed) ────────
 async function mapFieldsWithGroq(fingerprints, profile, log, jobText = "") {
   if (fingerprints.length === 0) return [];
 
@@ -785,7 +726,6 @@ async function mapFieldsWithGroq(fingerprints, profile, log, jobText = "") {
       jobText,
     );
 
-    // Filter hallucinated selectors
     const validSet = new Set(chunkSelectors);
     const valid = actions.filter(
       (a) => a.unanswered || validSet.has(a.selector),
@@ -796,8 +736,6 @@ async function mapFieldsWithGroq(fingerprints, profile, log, jobText = "") {
         `   🧹 Chunk ${i + 1}: filtered ${filtered} hallucinated selector(s).`,
       );
 
-    // Deduplicate — Groq sometimes emits multiple actions for the same selector.
-    // Keep only the last one (Groq tends to refine answers toward the end).
     const dedupMap = new Map();
     for (const a of valid) dedupMap.set(a.selector, a);
     const deduped = [...dedupMap.values()];
@@ -814,7 +752,6 @@ async function mapFieldsWithGroq(fingerprints, profile, log, jobText = "") {
   return allActions;
 }
 
-// ─── Execute Playwright actions ────────────────────────────────────────────────
 async function executeActions(page, actions, log) {
   let needsHuman = false;
   for (const action of actions) {
@@ -826,7 +763,6 @@ async function executeActions(page, actions, log) {
     try {
       switch (action.action) {
         case "fill": {
-          // Detect checkbox and auto-switch to click
           const elType = await page
             .evaluate(
               (sel) => document.querySelector(sel)?.type || "",
@@ -843,15 +779,11 @@ async function executeActions(page, actions, log) {
             if (shouldCheck !== checked)
               await page.click(action.selector, { timeout: 5000 });
           } else {
-            // React-compatible fill: use native value setter + dispatch events
-            // This is the same trick Simplify/Chrome extensions use to trigger
-            // React's synthetic event system (plain .value= doesn't work).
             const filled = await page
               .evaluate(
                 ({ sel, val }) => {
                   const el = document.querySelector(sel);
                   if (!el) return false;
-                  // Native value setter bypasses React's read-only descriptor
                   const proto =
                     el.tagName === "TEXTAREA"
                       ? window.HTMLTextAreaElement.prototype
@@ -871,7 +803,6 @@ async function executeActions(page, actions, log) {
               )
               .catch(() => false);
 
-            // Fallback to Playwright fill if evaluate didn't work
             if (!filled) {
               await page.fill(action.selector, String(action.value), {
                 timeout: 5000,
@@ -882,10 +813,6 @@ async function executeActions(page, actions, log) {
         }
 
         case "select": {
-          // 3-tier fuzzy select (same approach as Simplify):
-          // 1. Exact label match
-          // 2. Case-insensitive match
-          // 3. Neutral-keyword fallback for EEO/optional fields
           const target = String(action.value).toLowerCase().trim();
           const options = await page.evaluate((sel) => {
             const el = document.querySelector(sel);
@@ -901,13 +828,9 @@ async function executeActions(page, actions, log) {
             break;
           }
 
-          // Tier 1: exact
           let match = options.find((o) => o.text === String(action.value));
-          // Tier 2: case-insensitive
           if (!match)
             match = options.find((o) => o.text.toLowerCase() === target);
-          // Tier 3: partial keyword match — skip if first word is too short (e.g. "I")
-          // to avoid false-matching every option that contains the letter "i"
           if (!match) {
             const firstWord = target.split(" ")[0];
             if (firstWord.length >= 3) {
@@ -916,7 +839,6 @@ async function executeActions(page, actions, log) {
               );
             }
           }
-          // Tier 4: neutral fallback — for EEO/optional fields, find "safe" option
           if (!match) {
             const NEUTRAL = [
               "decline",
@@ -932,7 +854,6 @@ async function executeActions(page, actions, log) {
               NEUTRAL.some((kw) => o.text.toLowerCase().includes(kw)),
             );
           }
-          // Tier 5: skip first empty/placeholder option, pick first real option as last resort
           if (!match)
             match = options.find((o) => o.value !== "" && o.value !== "0");
 
@@ -950,24 +871,20 @@ async function executeActions(page, actions, log) {
           break;
         }
 
-        // intl-tel-input country code flag — set to India (+91) before phone fill
         case "phone_country": {
           try {
-            // Click the flag dropdown to open the country list
             const flagBtn = await page.$(
               '.iti__selected-flag, [class*="flag-dropdown"], [class*="country-select"]',
             );
             if (flagBtn && (await flagBtn.isVisible().catch(() => false))) {
               await flagBtn.click();
               await page.waitForTimeout(300);
-              // India option — intl-tel-input uses data-dial-code="91" or data-country-code="in"
               const indiaOpt = await page.$(
                 '[data-dial-code="91"], [data-country-code="in"], li.iti__country[data-country-code="in"]',
               );
               if (indiaOpt) {
                 await indiaOpt.click();
                 await page.waitForTimeout(150);
-                // Force-close the dropdown — if still open, phone fill will type into search box
                 await page.keyboard.press("Escape");
               } else {
                 await page.keyboard.press("Escape");
@@ -975,19 +892,17 @@ async function executeActions(page, actions, log) {
               await page.waitForTimeout(200);
             }
           } catch (e) {
-            // Non-fatal — country code dropdown may not exist on this form
+            /* Non-fatal — country code dropdown may not exist on this form */
           }
           break;
         }
 
-        // Custom autocomplete dropdown (location fields with Google Places / custom AC)
         case "autocomplete": {
           try {
             await page.click(action.selector, { timeout: 5000 });
           } catch {
             /* field may already be focused */
           }
-          // Clear existing value first, then type
           await page.evaluate((sel) => {
             const el = document.querySelector(sel);
             if (el) {
@@ -996,20 +911,15 @@ async function executeActions(page, actions, log) {
             }
           }, action.selector);
           await page.type(action.selector, String(action.value), { delay: 60 });
-          // Wait for autocomplete dropdown to appear
           await page.waitForTimeout(1200);
 
           const DROPDOWN_SELECTORS = [
-            // Google Places (Greenhouse location)
             ".pac-item:first-child",
             ".pac-container .pac-item:first-child",
-            // Generic ARIA options
             '[role="option"]:first-child',
             '[role="listbox"] [role="option"]:first-child',
-            // Lever location suggestion
             ".suggestions li:first-child",
             ".autocomplete-suggestions div:first-child",
-            // Common CSS class patterns
             ".select__option:first-child",
             ".dropdown-item:first-child",
             'li[role="option"]:first-child',
@@ -1031,12 +941,10 @@ async function executeActions(page, actions, log) {
             }
           }
           if (!picked) {
-            // Final fallback: keyboard navigation
             await page.keyboard.press("ArrowDown");
             await page.waitForTimeout(400);
             await page.keyboard.press("Enter");
           }
-          // Brief pause for field to commit the selected value
           await page.waitForTimeout(500);
           break;
         }
@@ -1074,7 +982,6 @@ async function executeActions(page, actions, log) {
   return needsHuman;
 }
 
-// ─── Attach resume ─────────────────────────────────────────────────────────────
 async function attachResume(page, resumePath, log) {
   if (!resumePath) return;
   try {
@@ -1088,7 +995,6 @@ async function attachResume(page, resumePath, log) {
   }
 }
 
-// ─── Verify Fill ───────────────────────────────────────────────────────────────
 async function verifyFill(page, actions, originalFingerprints, log) {
   log(`🔍 Verifying fill...`);
 
@@ -1109,14 +1015,10 @@ async function verifyFill(page, actions, originalFingerprints, log) {
               results.push({ ...action, status: "NOT_FOUND", actual: null });
               break;
             }
-            // Skip file inputs — they return C:\fakepath\ on readback, never
-            // the real path. Treat as OK since attachResume() handles them separately.
             if (el.type === "file") {
               results.push({ ...action, status: "OK", actual: "(file)" });
               break;
             }
-            // Strip all formatting chars for phone/tel fields — carriers and
-            // browser phone-input libraries insert spaces in different positions.
             const isPhoneLike =
               /phone|mobile|tel/i.test(action.selector) ||
               /phone|mobile/i.test(el.getAttribute("aria-label") || "") ||
@@ -1138,6 +1040,24 @@ async function verifyFill(page, actions, originalFingerprints, log) {
               results.push({ ...action, status: "NOT_FOUND", actual: null });
               break;
             }
+            // Not a native <select> — some ATS platforms (Greenhouse custom
+            // question types especially) render custom-styled dropdowns that
+            // look like a select but have no .options/.selectedIndex at all.
+            // Reading el.options[el.selectedIndex] on those throws
+            // "Cannot read properties of undefined (reading 'undefined')" —
+            // this guard turns that crash into a clean, informative status
+            // instead, and treats it as OK so it doesn't block submission
+            // (the same custom-dropdown case is already treated as
+            // best-effort/skippable in executeActions above).
+            if (!el.options || el.selectedIndex === undefined) {
+              results.push({
+                ...action,
+                status: "OK",
+                actual:
+                  "(custom dropdown, not a native <select> — skipped verification)",
+              });
+              break;
+            }
             const selected = el.options[el.selectedIndex]?.text?.trim() ?? "";
             const NEUTRAL_KW = [
               "decline",
@@ -1155,7 +1075,6 @@ async function verifyFill(page, actions, originalFingerprints, log) {
             const isNeutralActual = NEUTRAL_KW.some((kw) =>
               selected.toLowerCase().includes(kw),
             );
-            // OK if exact match OR both sides are "decline" equivalents
             const match =
               selected.toLowerCase() === String(action.value).toLowerCase() ||
               (isNeutralExpected && isNeutralActual);
@@ -1176,9 +1095,6 @@ async function verifyFill(page, actions, originalFingerprints, log) {
               `input[name="${name}"][value="${action.value}"]`,
             );
             if (!radio) {
-              // Lever card fields (cards[UUID][fieldN]) may be conditionally hidden —
-              // NOT_FOUND here means the element isn't in DOM, not that fill failed.
-              // Treat as OK to avoid blocking submission.
               const isCardField = name.startsWith("cards[");
               results.push({
                 ...action,
@@ -1247,23 +1163,67 @@ async function verifyFill(page, actions, originalFingerprints, log) {
   return { mismatches, newFields };
 }
 
-// ─── Lever: navigate to apply sub-page ────────────────────────────────────────
+// ─── Wait for the real application form to render ──────────────────────────
+// Root cause behind BOTH the Lever "0 fields found" cases AND the Greenhouse
+// "found department-filter/office-filter" cases in your logs: a fixed
+// 1.5s wait after navigation isn't enough time for these React/SPA-based
+// job boards to route from "page shell" to "the actual application form."
+// On Greenhouse specifically, landing too early can mean the agent
+// fingerprints the general job-board LISTING page (with search filters like
+// #department-filter, #office-filter) instead of the specific job's
+// application form — which is exactly what happened on the Xometry and
+// Netlify jobs in your log (found 4 and 1 fields respectively, none of them
+// real application fields).
+//
+// This waits for a concrete signal that the real form is present — a file
+// upload input (present on essentially every ATS application form) or
+// visible "submit"/"apply" text — instead of guessing a fixed delay.
+async function waitForApplicationForm(page, log, timeoutMs = 12000) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const hasFileInput = !!document.querySelector('input[type="file"]');
+        const hasNameOrEmail = !!document.querySelector(
+          'input[name="name"], input[name="email"], input[name*="name" i], input[type="email"]',
+        );
+        const bodyText = (document.body?.innerText || "").toLowerCase();
+        const hasSubmitText =
+          bodyText.includes("submit application") ||
+          bodyText.includes("submit your application");
+        return hasFileInput || hasNameOrEmail || hasSubmitText;
+      },
+      { timeout: timeoutMs },
+    );
+    return true;
+  } catch {
+    log(
+      `⚠️  Application form did not show a clear ready-signal within ${timeoutMs / 1000}s — continuing anyway (may land on a listing/filter page instead of the real form).`,
+    );
+    return false;
+  }
+}
+
 async function openLeverForm(page, url, log) {
   const base = url.split("#")[0].replace(/\/$/, "");
   const applyUrl = base.endsWith("/apply") ? base : `${base}/apply`;
   log(`🔗 Lever detected — navigating to apply page: ${applyUrl}`);
   await page.goto(applyUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  // Widened from 10s to 20s, and broadened the selector set — your logs
+  // showed the page itself taking 10-13s to respond even before the form
+  // had to render on top of that, so 10s was cutting it right at the wire.
+  // Also added resume/comments fields as fallback signals, since some Lever
+  // tenants customize field names and don't always expose name/email first.
   try {
-    await page.waitForSelector('input[name="name"], input[name="email"]', {
-      timeout: 10000,
-    });
+    await page.waitForSelector(
+      'input[name="name"], input[name="email"], input[name="resume"], textarea[name="comments"], input[type="file"]',
+      { timeout: 20000 },
+    );
     log(`   Lever form loaded.`);
   } catch {
     log(`⚠️  Lever form did not load in time — continuing anyway.`);
   }
 }
 
-// ─── Job Relevance Score ───────────────────────────────────────────────────────
 function scoreJobRelevance(jobText, profile) {
   const text = (jobText || "").toLowerCase();
 
@@ -1281,9 +1241,6 @@ function scoreJobRelevance(jobText, profile) {
     }
   }
 
-  // candidateYears: parse profile.yearsOfExperience. If missing/empty, treat
-  // as 0 (fresher) — this is the CORRECT default, not a bypass. A fresher
-  // should be filtered OUT of jobs requiring 2+ years, not shown everything.
   const hasYearsField =
     profile.yearsOfExperience !== undefined &&
     profile.yearsOfExperience !== null &&
@@ -1308,13 +1265,11 @@ function scoreJobRelevance(jobText, profile) {
       reason: "No skills in profile — add skills for better matching.",
     };
 
-  // Fuzzy skill matching — handles React.js/ReactJS/React, Node.js/NodeJS/Node etc.
-  // For each skill, build variants: raw, stripped of .js, stripped of spaces/dots
   const skillVariants = skills.map((s) => [
-    s, // "react.js"
-    s.replace(/\.js$/i, ""), // "react"
-    s.replace(/[.\s]/g, ""), // "reactjs"
-    s.replace(/[.\s-]/g, " ").trim(), // "react js" → normalized
+    s,
+    s.replace(/\.js$/i, ""),
+    s.replace(/[.\s]/g, ""),
+    s.replace(/[.\s-]/g, " ").trim(),
   ]);
 
   const matched = skillVariants.filter((variants) =>
@@ -1335,24 +1290,29 @@ function scoreJobRelevance(jobText, profile) {
   };
 }
 
-// ─── Submit detection ──────────────────────────────────────────────────────────
 async function findSubmitButton(page) {
   const CANDIDATES = [
+    '[data-automation-id="bottom-navigation-submit-button"]',
     'button[type="submit"]',
     'input[type="submit"]',
     '[data-testid="submit-app-btn"]',
     '[data-testid="apply-button"]',
     'button:has-text("Submit Application")',
+    'button:has-text("Submit application")',
     'button:has-text("Submit")',
+    'button:has-text("Send Application")',
     'button:has-text("Apply Now")',
     'button:has-text("Apply")',
     ".submit-btn",
     "#submit-app",
+    "#submit_app",
   ];
   for (const sel of CANDIDATES) {
     try {
       const btn = await page.$(sel);
-      if (btn && (await btn.isVisible())) return btn;
+      if (btn && (await btn.isVisible()) && !(await btn.isDisabled())) {
+        return btn;
+      }
     } catch {
       /* continue */
     }
@@ -1360,12 +1320,9 @@ async function findSubmitButton(page) {
   return null;
 }
 
-// ─── Multi-step form: find a "Next" / "Continue" button ───────────────────────
-// Greenhouse sometimes splits applications into Step 1 (resume upload) and
-// Step 2 (custom questions). This helper finds the inter-step navigation button
-// so the agent can advance to the next page and re-fingerprint.
 async function findNextButton(page) {
   const CANDIDATES = [
+    '[data-automation-id="bottom-navigation-next-button"]',
     'button:has-text("Next")',
     'button:has-text("Continue")',
     'button:has-text("Next Step")',
@@ -1385,29 +1342,18 @@ async function findNextButton(page) {
   return null;
 }
 
-// ─── ATS Field Registry helpers ───────────────────────────────────────────────
-// inferMapsTo: tries to identify which profile key produced a given value.
-// Works well for unique strings (email, phone, urls, names).
-// Returns null for static option values (Yes/No, EEO answers, etc.) — that's fine,
-// the selector+action pair is still useful in the registry even without mapsTo.
 function inferMapsTo(value, profile) {
   if (value === null || value === undefined) return null;
   const needle = String(value).trim().toLowerCase();
   if (!needle) return null;
   for (const [key, val] of Object.entries(profile)) {
     if (val === null || val === undefined) continue;
-    if (typeof val === "object") continue; // skip arrays, objects
+    if (typeof val === "object") continue;
     if (String(val).trim().toLowerCase() === needle) return key;
   }
   return null;
 }
 
-// saveToRegistry: persists verified+submitted fills to MongoDB.
-// SAFETY CONTRACT: caller MUST only invoke this when:
-//   - mismatches.length === 0 (after retry)
-//   - newFields.length === 0
-//   - submit button was found and clicked without error
-// Any deviation from that and this function is never reached.
 async function saveToRegistry(
   platform,
   allActions,
@@ -1415,6 +1361,7 @@ async function saveToRegistry(
   profile,
   jobUrl,
   log,
+  userId,
 ) {
   try {
     const fingerprintBySelector = new Map(
@@ -1423,7 +1370,6 @@ async function saveToRegistry(
 
     const ops = [];
     for (const action of allActions) {
-      // Skip anything that isn't a real fill
       if (!action.selector) continue;
       if (action.unanswered || action.action === "unanswered") continue;
       if (action.action === "file" || action.action === "skip") continue;
@@ -1440,21 +1386,21 @@ async function saveToRegistry(
 
       ops.push({
         updateOne: {
-          filter: { platform, selector: action.selector },
+          filter: { userId, platform, selector: action.selector },
           update: {
             $inc: { seenCount: 1, successCount: 1 },
             $set: {
               action: action.action,
               lastSeen: new Date(),
               lastJobUrl: jobUrl,
-              // Only overwrite label/mapsTo if we have a better value than what's stored
               ...(label && { label }),
               ...(mapsTo && { mapsTo }),
             },
             $setOnInsert: {
+              userId,
               platform,
               selector: action.selector,
-              seenCount: 0, // $inc will add 1 on top
+              seenCount: 0,
               successCount: 0,
             },
           },
@@ -1468,12 +1414,10 @@ async function saveToRegistry(
     await FieldRegistry.bulkWrite(ops, { ordered: false });
     log(`📚 Registry: ${ops.length} selector(s) recorded.`);
   } catch (err) {
-    // Registry errors must never crash the application agent
     log(`⚠️  Registry write skipped: ${err.message.split("\n")[0]}`);
   }
 }
 
-// ─── Main Agent ────────────────────────────────────────────────────────────────
 export const runApplicationAgent = async (
   job,
   profile,
@@ -1492,9 +1436,6 @@ export const runApplicationAgent = async (
     page = await context.newPage();
 
     const isLever = job.url.includes("jobs.lever.co");
-    // ── Navigate + grab job description text ──────────────────────────────
-    // For Lever: score BEFORE navigating to /apply — the apply page is just
-    // a form with no job description, so scoring there always returns 0.
     let jobText = "";
     if (isLever) {
       await page.goto(job.url, {
@@ -1515,11 +1456,16 @@ export const runApplicationAgent = async (
       jobText = await page
         .evaluate(() => document.body.innerText)
         .catch(() => "");
+      // Give Greenhouse/Workday/other SPA-based boards time to route to the
+      // actual job's application form before fingerprinting. Without this,
+      // fingerprinting can run while the page is still showing the general
+      // job-board LISTING view (with #department-filter/#office-filter
+      // search controls) rather than the specific job's apply form — which
+      // is what happened on the Xometry/Netlify jobs in the earlier log.
+      await waitForApplicationForm(page, log);
     }
 
-    // ── Relevance Score ───────────────────────────────────────────────────
     log(`📊 Scoring job relevance...`);
-    // jobText already captured above before any /apply navigation
     const relevance = scoreJobRelevance(jobText, profile);
     log(`   Score: ${relevance.score}/100 — ${relevance.reason}`);
 
@@ -1535,8 +1481,6 @@ export const runApplicationAgent = async (
     job.status = "ANALYZING_FORM";
     await job.save();
 
-    // ── CAPTCHA early detection ────────────────────────────────────────────
-    // Check before fingerprinting so we don't waste time filling then failing
     const hasCaptcha = await page.evaluate(() => {
       const bodyText = document.body?.innerText?.toLowerCase() || "";
       const hasCaptchaFrame = !!document.querySelector(
@@ -1552,14 +1496,68 @@ export const runApplicationAgent = async (
       return hasCaptchaFrame || hasCaptchaText;
     });
     if (hasCaptcha) {
-      log(`🤖 CAPTCHA detected — marking CAPTCHA_BLOCKED and skipping.`);
+      log(
+        `🤖 CAPTCHA detected — pausing so you can solve it manually in the browser.`,
+      );
       job.status = "CAPTCHA_BLOCKED";
+      job.holdStartedAt = new Date();
       await job.save();
-      await page.close().catch(() => {});
-      return;
+      await waitForHuman(
+        90000,
+        "✅ Marked as solved — re-checking the page...",
+        log,
+      );
+      const stillThere = await page
+        .evaluate(() => {
+          const bodyText = document.body?.innerText?.toLowerCase() || "";
+          return (
+            !!document.querySelector(
+              'iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .h-captcha, .g-recaptcha, [data-sitekey], #challenge-form',
+            ) || bodyText.includes("verify you are human")
+          );
+        })
+        .catch(() => true);
+      if (stillThere) {
+        log(`🤖 CAPTCHA still present — skipping this one for now.`);
+        await page.close().catch(() => {});
+        return;
+      }
+      log(`✅ CAPTCHA cleared — continuing.`);
+      job.status = "ANALYZING_FORM";
+      await job.save();
     }
 
-    // ── DOM Fingerprinting ─────────────────────────────────────────────────
+    const platform = detectPlatform(job.url);
+
+    if (platform === "workday") {
+      const onAccountPage = await page
+        .evaluate(() => {
+          const bodyText = document.body?.innerText?.toLowerCase() || "";
+          return (
+            !!document.querySelector(
+              '[data-automation-id="signInLink"], [data-automation-id="createAccountLink"], [data-automation-id="createAccountSubmitButton"]',
+            ) ||
+            (bodyText.includes("create account") &&
+              bodyText.includes("password")) ||
+            (bodyText.includes("sign in") &&
+              bodyText.includes("apply manually"))
+          );
+        })
+        .catch(() => false);
+
+      if (onAccountPage) {
+        log(
+          `🔐 Workday account/sign-in page detected — pausing for you to sign in or create an account.`,
+        );
+        job.status = "ACCOUNT_SETUP_NEEDED";
+        job.holdStartedAt = new Date();
+        await job.save();
+        await waitForHuman(90000, "✅ Marked done — continuing.", log);
+        job.status = "ANALYZING_FORM";
+        await job.save();
+      }
+    }
+
     log(`🔬 Fingerprinting DOM...`);
     const fingerprints = await page.evaluate(FINGERPRINT_FN);
     log(`   Found ${fingerprints.length} fields.`);
@@ -1575,17 +1573,13 @@ export const runApplicationAgent = async (
     job.status = "APPLYING";
     await job.save();
 
-    // ── Phase 0a: Registry acceleration ─────────────────────────────────────
-    // For known selectors (successCount >= 2), skip all AI phases — use cached
-    // mapping directly. This is the self-improving moat: after 10+ clean runs,
-    // most fields bypass Groq entirely.
     let registryActions = [];
     let registrySelectors = new Set();
     try {
-      // FieldRegistry is imported at the top of this file — no dynamic import needed
       const currentSelectorSet = new Set(fingerprints.map((f) => f.selector));
       const hits = await FieldRegistry.find({
-        platform: detectPlatform(job.url) || "unknown",
+        userId: job.userId,
+        platform: platform || "unknown",
         successCount: { $gte: 2 },
       }).lean();
       registryActions = hits
@@ -1606,8 +1600,6 @@ export const runApplicationAgent = async (
       log(`⚠️  Registry read skipped (non-fatal): ${regErr.message}`);
     }
 
-    // ── Phase 0: Platform-specific name-attr mapping (Greenhouse / Lever) ─────
-    const platform = detectPlatform(job.url);
     let platformActions = [];
     let handledSelectors = new Set();
 
@@ -1622,13 +1614,11 @@ export const runApplicationAgent = async (
       );
     }
 
-    // Filter fingerprints already handled by registry or platform adapter
     const remainingAfterPlatform = fingerprints.filter(
       (f) =>
         !handledSelectors.has(f.selector) && !registrySelectors.has(f.selector),
     );
 
-    // ── Phase 1: Deterministic label matcher (on remaining fields only) ───────
     log(
       `⚡ Running deterministic label matcher on ${remainingAfterPlatform.length} remaining fields...`,
     );
@@ -1640,7 +1630,6 @@ export const runApplicationAgent = async (
       `   ✅ Deterministic: ${deterministicActions.length} fields mapped. ${unmatched.length} sent to Groq.`,
     );
 
-    // ── Phase 2: Groq for remaining unmatched fields ───────────────────────
     let groqActions = [];
     if (unmatched.length > 0) {
       try {
@@ -1662,13 +1651,25 @@ export const runApplicationAgent = async (
       `📋 Total actions: ${allActions.length} (registry: ${registryActions.length}, platform: ${platformActions.length}, deterministic: ${deterministicActions.length}, groq: ${groqActions.length})`,
     );
 
-    // ── Attach resume ──────────────────────────────────────────────────────
     await attachResume(page, profile.resumePath, log);
 
-    // ── Fill ───────────────────────────────────────────────────────────────
+    if (platform === "workday") {
+      try {
+        const autofillBtn = await page.$(
+          '[data-automation-id="autofillWithResume"], button:has-text("Autofill with Resume"), button:has-text("Use this resume")',
+        );
+        if (autofillBtn && (await autofillBtn.isVisible())) {
+          log(`📄 Workday resume autofill button found — using it.`);
+          await autofillBtn.click();
+          await page.waitForTimeout(2500).catch(() => {});
+        }
+      } catch {
+        /* not present — fine, continue with normal mapping */
+      }
+    }
+
     let needsHuman = await executeActions(page, allActions, log);
 
-    // ── Verify ────────────────────────────────────────────────────────────
     const { mismatches, newFields } = await verifyFill(
       page,
       allActions,
@@ -1676,7 +1677,6 @@ export const runApplicationAgent = async (
       log,
     );
 
-    // ── Retry mismatches once ──────────────────────────────────────────────
     let finalMismatches = [];
     if (mismatches.length > 0) {
       log(`🔄 Retrying ${mismatches.length} mismatch(es)...`);
@@ -1687,7 +1687,6 @@ export const runApplicationAgent = async (
         fingerprints,
         log,
       );
-      // Deduplicate by selector — pronouns cascade (20x same selector) counts as 1
       finalMismatches = [
         ...new Map(stillBroken.map((m) => [m.selector, m])).values(),
       ];
@@ -1704,9 +1703,6 @@ export const runApplicationAgent = async (
       needsHuman = true;
     }
 
-    // ── Only block on REQUIRED unmapped/mismatched fields ────────────────
-    // EEO fields (gender/race/veteran/pronouns) and Lever card fields are
-    // never truly required for submission — exclude them from the blocker check.
     const EEO_OR_CARD =
       /eeo\[|pronouns|\/gender|#gender|\/race|#race|veteran|disability|cards\[/i;
     const requiredUnmapped = fingerprints.filter(
@@ -1717,7 +1713,6 @@ export const runApplicationAgent = async (
       const fp = fingerprints.find((f) => f.selector === m.selector);
       return fp?.required;
     });
-    // Override needsHuman — only true if REQUIRED non-EEO fields are broken
     if (
       needsHuman &&
       requiredUnmapped.length === 0 &&
@@ -1737,25 +1732,14 @@ export const runApplicationAgent = async (
         `⚠️  Complete remaining fields in the browser, then click "Done" in the UI. Auto-closes in 90s.`,
       );
       job.status = "MANUAL_REVIEW_NEEDED";
+      job.holdStartedAt = new Date();
       await job.save();
+      const userClickedDone = await waitForHuman(
+        90000,
+        "✅ Manual review marked done — moving to next job.",
+        log,
+      );
 
-      // Poll every second — resolves immediately when user clicks "Done" in UI,
-      // or after 90s hard timeout.
-      const waitStart = Date.now();
-      let userClickedDone = false;
-      while (Date.now() - waitStart < 90000) {
-        if (waitControl.skip) {
-          waitControl.skip = false; // reset for next job
-          userClickedDone = true;
-          log("✅ Manual review marked done — moving to next job.");
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-
-      // ── Learn from manual corrections ─────────────────────────────────
-      // Re-verify what's now on the page and save any correctly-filled fields
-      // to the registry — so next time this form is seen, we skip AI for them.
       if (userClickedDone && platform) {
         try {
           const { mismatches: afterManual } = await verifyFill(
@@ -1775,6 +1759,7 @@ export const runApplicationAgent = async (
               profile,
               job.url,
               log,
+              job.userId,
             );
             log(
               `📚 Registry: learned ${cleanActions.length} field(s) from manual correction.`,
@@ -1785,11 +1770,8 @@ export const runApplicationAgent = async (
         }
       }
       await page.close().catch(() => {});
-      // Re-queue: reset to DISCOVERED so orchestrator picks it up next run.
-      // This prevents MANUAL_REVIEW_NEEDED jobs from piling up silently.
       job.status = "DISCOVERED";
       job.retryCount = (job.retryCount || 0) + 1;
-      // Stop re-queuing after 3 attempts — it's genuinely unautomatable
       if (job.retryCount >= 3) {
         job.status = "FAILED";
         log(`❌ Job exceeded 3 manual review attempts — marking FAILED.`);
@@ -1800,26 +1782,20 @@ export const runApplicationAgent = async (
       return;
     }
 
-    // ── Multi-step form handling (Greenhouse step 1 → step 2) ────────────
-    // If there's no submit button but there IS a Next/Continue button,
-    // the form is paginated. Click Next, wait for the new step to load,
-    // re-fingerprint, map, fill, and verify the new fields before proceeding.
-    // We cap at 5 steps to avoid infinite loops on broken forms.
-    const MAX_STEPS = 5;
+    const MAX_STEPS = platform === "workday" ? 8 : 5;
     let stepCount = 0;
     while (stepCount < MAX_STEPS) {
       const submitCheck = await findSubmitButton(page);
-      if (submitCheck) break; // normal exit — we're on the last step
+      if (submitCheck) break;
 
       const nextBtn = await findNextButton(page);
-      if (!nextBtn) break; // neither submit nor next — bail out below
+      if (!nextBtn) break;
 
       stepCount++;
       log(`📄 Multi-step form — clicking Next (step ${stepCount})...`);
       const urlBefore = page.url();
       await nextBtn.click();
 
-      // Wait for step transition: URL change OR new fields appearing
       try {
         await Promise.race([
           page.waitForURL((u) => u !== urlBefore, { timeout: 8000 }),
@@ -1836,11 +1812,38 @@ export const runApplicationAgent = async (
       }
       await page.waitForTimeout(1000).catch(() => {});
 
-      // Re-fingerprint the new step — filter out selectors already seen in
-      // previous steps so we don't re-fill fields that were on step 1.
+      if (platform === "workday") {
+        const onSensitiveStep = await page
+          .evaluate(() => {
+            const heading = (
+              document.querySelector(
+                "h2, h1, [data-automation-id='pageHeader']",
+              )?.innerText || ""
+            ).toLowerCase();
+            return (
+              heading.includes("voluntary disclosure") ||
+              heading.includes("self identify") ||
+              heading.includes("self-identify")
+            );
+          })
+          .catch(() => false);
+
+        if (onSensitiveStep) {
+          log(
+            `🧍 Workday Voluntary Disclosures / Self Identify step — these are your own legal self-attestation, not something Apex will guess at. Pausing for you.`,
+          );
+          job.status = "MANUAL_REVIEW_NEEDED";
+          job.readyForHumanSubmit = false;
+          job.holdStartedAt = new Date();
+          await job.save();
+          await waitForHuman(90000, "✅ Marked done — continuing.", log);
+          job.status = "ANALYZING_FORM";
+          await job.save();
+        }
+      }
+
       const allStepFingerprints = await page.evaluate(FINGERPRINT_FN);
       const knownStepSelectors = new Set(fingerprints.map((f) => f.selector));
-      // Also track selectors from previous multi-steps
       if (stepCount > 1) {
         allActions.forEach((a) => knownStepSelectors.add(a.selector));
       }
@@ -1852,7 +1855,6 @@ export const runApplicationAgent = async (
       );
       if (stepFingerprints.length === 0) break;
 
-      // Map + fill the new step's fields
       const { actions: stepDeterministic, unmatched: stepUnmatched } =
         deterministicMap(stepFingerprints, profile);
       let stepGroqActions = [];
@@ -1880,71 +1882,46 @@ export const runApplicationAgent = async (
       if (stepNeedsHuman || stepMismatches.length > 0) {
         log(`⚠️  Step ${stepCount} has issues — flagging for manual review.`);
         job.status = "MANUAL_REVIEW_NEEDED";
+        job.holdStartedAt = new Date();
         await job.save();
-        await new Promise((r) => setTimeout(r, 90000));
+        await waitForHuman(90000, "✅ Marked done — continuing.", log);
         await page.close().catch(() => {});
         return;
       }
-      // Add step actions to allActions for registry recording
       allActions.push(...stepActions);
     }
 
-    // ── SUBMIT (hard gate: only fires on 100% clean verify) ───────────────
-    // Conditions already guaranteed by the needsHuman check above:
-    //   - needsHuman === false  → no unanswered fields, no conditional fields
-    //   - mismatches.length === 0 after retry
-    // If either condition failed we returned MANUAL_REVIEW_NEEDED already.
     log(`🔍 Verify clean — searching for submit button...`);
     const submitBtn = await findSubmitButton(page);
 
     if (!submitBtn) {
       log(`⚠️  Submit button not found — flagging for manual review.`);
       job.status = "MANUAL_REVIEW_NEEDED";
+      job.holdStartedAt = new Date();
       await job.save();
-      await new Promise((r) => setTimeout(r, 90000));
+      await waitForHuman(90000, "✅ Marked done — continuing.", log);
       await page.close().catch(() => {});
       return;
     }
 
-    if (DRY_RUN) {
-      // ── DRY RUN: do everything except click submit ────────────────────
-      // Form is filled and verified — hold the browser open so you can
-      // inspect every field before deciding whether the mapping is correct.
-      log(
-        `🧪 DRY RUN — all fields verified clean. Submit button found but NOT clicked.`,
-      );
-      log(
-        `🧪 Review the filled form in the browser now. Set DRY_RUN=false in .env to enable real submission.`,
-      );
-      job.status = "MANUAL_REVIEW_NEEDED";
-      job.dryRun = true;
-      await job.save();
+    log(
+      `✅ All fields verified clean. Submit button found but NOT clicked — that's your call.`,
+    );
+    log(
+      `👤 Review the filled form in the browser now, then click Submit yourself if it looks right.`,
+    );
+    job.status = "MANUAL_REVIEW_NEEDED";
+    job.readyForHumanSubmit = true;
+    job.holdStartedAt = new Date();
+    await job.save();
 
-      const waitStart = Date.now();
-      while (Date.now() - waitStart < 90000) {
-        if (waitControl.skip) {
-          waitControl.skip = false;
-          log("✅ Reviewed — moving to next job.");
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-      await page.close().catch(() => {});
-      if (ownContext) await context.close();
-      return;
-    }
+    const urlBeforeWait = page.url();
+    await waitForHuman(
+      90000,
+      "✅ Marked done — checking whether it was submitted...",
+      log,
+    );
 
-    log(`🚀 All fields verified — submitting application...`);
-    const urlBeforeSubmit = page.url();
-    await submitBtn.click();
-
-    // ── Submit confirmation: verify page actually changed ─────────────────
-    // Don't blindly trust a timeout. Check for:
-    //   1. URL change (most ATS redirect to a /confirmation or /thank-you page)
-    //   2. "Thank you" / "Application received" text appearing on page
-    // Falls back to a 10s wait if neither signal fires, then checks text anyway.
-    // Simple phrase matching — avoids regex flag loss when patterns cross the
-    // Playwright evaluate() serialisation boundary (.source drops /i flag).
     const THANKS_PHRASES = [
       "thank you",
       "application received",
@@ -1957,65 +1934,42 @@ export const runApplicationAgent = async (
       "you have applied",
       "confirmation",
     ];
-    const getPageTextLower = async () =>
-      (
-        await page
-          .evaluate(() => document.body?.innerText || "")
-          .catch(() => "")
-      ).toLowerCase();
+    const pageTextLower = (
+      await page.evaluate(() => document.body?.innerText || "").catch(() => "")
+    ).toLowerCase();
+    const submitted =
+      page.url() !== urlBeforeWait ||
+      THANKS_PHRASES.some((p) => pageTextLower.includes(p));
 
-    let confirmed = false;
-    try {
-      await Promise.race([
-        page.waitForURL((url) => url !== urlBeforeSubmit, { timeout: 10000 }),
-        (async () => {
-          const deadline = Date.now() + 10000;
-          while (Date.now() < deadline) {
-            const txt = await getPageTextLower();
-            if (THANKS_PHRASES.some((p) => txt.includes(p))) return;
-            await new Promise((r) => setTimeout(r, 600));
-          }
-          throw new Error("thank-you text not found within timeout");
-        })(),
-      ]);
-      confirmed = true;
-    } catch {
-      const txt = await getPageTextLower();
-      confirmed = THANKS_PHRASES.some((p) => txt.includes(p));
-    }
-
-    if (confirmed) {
-      log(
-        `✅ Application submitted and confirmed (page changed after submit).`,
-      );
+    if (submitted) {
+      log(`✅ Looks like it went through — marking APPLIED.`);
+      if (platform) {
+        try {
+          await saveToRegistry(
+            platform,
+            allActions,
+            fingerprints,
+            profile,
+            job.url,
+            log,
+            job.userId,
+          );
+        } catch (e) {
+          log(`⚠️  Registry save skipped: ${e.message}`);
+        }
+      }
+      job.status = "APPLIED";
+      job.appliedAt = new Date();
     } else {
       log(
-        `⚠️  Submit clicked but no confirmation signal detected — marking MANUAL_REVIEW_NEEDED.`,
+        `ℹ️  No confirmation detected — leaving as manual review for you to finish or retry.`,
       );
-      job.status = "MANUAL_REVIEW_NEEDED";
-      await job.save();
-      await new Promise((r) => setTimeout(r, 90000));
-      await page.close().catch(() => {});
-      return;
     }
-
-    // ── Registry: record ONLY after clean verify + successful submit ───────
-    // saveToRegistry is wrapped in try-catch internally — cannot crash here.
-    await saveToRegistry(
-      platform || "unknown",
-      allActions,
-      fingerprints,
-      profile,
-      job.url,
-      log,
-    );
-
-    job.status = "APPLIED";
-    job.appliedAt = new Date();
     await job.save();
 
     await page.close().catch(() => {});
     if (ownContext) await context.close();
+    return;
   } catch (err) {
     log(`❌ Fatal error: ${err.message}`);
     job.status = "FAILED_NEEDS_HEALING";

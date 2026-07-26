@@ -2,7 +2,7 @@ import { JobLead } from "../models/JobLead.js";
 import { launchBrowser } from "../services/browser.manager.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const randomDelay = (min = 2000, max = 5000) =>
+const randomDelay = (min = 1000, max = 2000) =>
   sleep(Math.floor(Math.random() * (max - min + 1)) + min);
 
 // ─── Strict job URL validator ──────────────────────────────────────────────────
@@ -25,6 +25,10 @@ const isRealJobUrl = (url) => {
           pathname,
         );
       return isJobsHost && hasUUID;
+    }
+    if (hostname.includes("myworkdayjobs.com")) {
+      // e.g. https://nvidia.wd5.myworkdayjobs.com/en-US/.../job/.../Some-Title_R12345
+      return pathname.includes("/job/");
     }
     return false;
   } catch {
@@ -89,7 +93,13 @@ const getCountryHint = (loc) => {
 };
 
 // ─── Main Discovery Agent ─────────────────────────────────────────────────────
-export const runDiscoveryAgent = async (profile, location, io) => {
+export const runDiscoveryAgent = async (
+  profile,
+  location,
+  io,
+  platform,
+  userId,
+) => {
   const log = (msg) => io.emit("log", { message: `[APEX DISCOVERY]: ${msg}` });
 
   const titles = profile.titles || ["Software Engineer"];
@@ -125,11 +135,21 @@ export const runDiscoveryAgent = async (profile, location, io) => {
       // DDG returning the same 10 results for every search.
       // Split greenhouse and lever into separate queries — DDG's OR operator
       // often returns fewer results than two separate targeted searches.
+      // NOTE: title alone is used — no hardcoded "developer"/"software engineer"
+      // suffix, so this works for any role (designer, marketer, analyst, etc.)
+      //
+      // Two variants keep the exact-phrase quotes (precise, but real postings
+      // rarely contain a Gemini-generated title like "MERN Full Stack
+      // Developer" verbatim — this alone can starve discovery down to a
+      // handful of results). The other two drop the quotes so DDG does
+      // ordinary relevance matching on the same words instead of requiring
+      // an exact substring match.
       const queryVariants = [
-        `site:job-boards.greenhouse.io ${title} software engineer`,
-        `site:jobs.lever.co ${title} developer`,
-        `site:boards.greenhouse.io OR site:job-boards.greenhouse.io "${title}" remote`,
+        `site:job-boards.greenhouse.io "${title}" remote`,
         `site:jobs.lever.co "${title}" remote`,
+        `site:boards.greenhouse.io OR site:job-boards.greenhouse.io ${title} remote`,
+        `site:jobs.lever.co ${title} remote hiring`,
+        `site:myworkdayjobs.com ${title} remote`,
       ];
 
       for (let i = 0; i < queryVariants.length; i++) {
@@ -137,15 +157,17 @@ export const runDiscoveryAgent = async (profile, location, io) => {
         log(`🔍 Searching: ${title} — query ${i + 1}/${queryVariants.length}`);
         const urls = await searchDDG(page, query, log);
         urls.forEach((u) => urlSet.add(u));
-        // Stagger requests to avoid DDG rate-limiting
-        await randomDelay(2000, 4000);
+        // Stagger requests to avoid DDG rate-limiting — kept non-zero on
+        // purpose, this protects YOU from getting your IP rate-limited by
+        // DDG, which would be far worse for speed than this delay is.
+        await randomDelay(1000, 2000);
       }
 
       const urls = [...urlSet];
       log(`   Found ${urls.length} unique valid URL(s) for "${title}"`);
 
       for (const url of urls) {
-        const exists = await JobLead.findOne({ url });
+        const exists = await JobLead.findOne({ url, userId });
         if (exists) {
           log(`⏭️  Already tracked: ${url}`);
           continue;
@@ -157,7 +179,7 @@ export const runDiscoveryAgent = async (profile, location, io) => {
             waitUntil: "domcontentloaded",
             timeout: 20000,
           });
-          await randomDelay(1000, 2000);
+          await randomDelay(500, 1000);
 
           const jobText = await page
             .evaluate(() => document.body.innerText)
@@ -171,6 +193,7 @@ export const runDiscoveryAgent = async (profile, location, io) => {
           }
 
           const newLead = new JobLead({
+            userId,
             company: extractCompanyName(url),
             jobTitle: title,
             url,
@@ -184,7 +207,7 @@ export const runDiscoveryAgent = async (profile, location, io) => {
         }
       }
 
-      await randomDelay(3000, 6000);
+      await randomDelay(1500, 3000);
     }
 
     log(`🏁 Discovery complete. ${totalSaved} new leads saved.`);
@@ -216,7 +239,12 @@ const passesSalaryFilter = (jobDescription, minUserSalary) => {
 
 const extractCompanyName = (url) => {
   try {
-    const { pathname } = new URL(url);
+    const { hostname, pathname } = new URL(url);
+    if (hostname.includes("myworkdayjobs.com")) {
+      // e.g. nvidia.wd5.myworkdayjobs.com → "nvidia" (first label of the subdomain)
+      const company = hostname.split(".")[0];
+      return company?.replace(/-/g, " ").toUpperCase() || "UNKNOWN";
+    }
     const parts = pathname.split("/").filter((p) => p);
     return parts[0]?.replace(/-/g, " ").toUpperCase() || "UNKNOWN";
   } catch {

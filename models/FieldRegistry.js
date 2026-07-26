@@ -15,6 +15,18 @@ import mongoose from "mongoose";
 
 const fieldRegistrySchema = new mongoose.Schema(
   {
+    // Owner of this registry entry. Note: this data is structural only
+    // (selector type + which profile KEY it maps to, never the actual value),
+    // so sharing it across users would be technically safe — but it's kept
+    // per-user for now to match a strict "nothing crosses between accounts"
+    // policy. Can be revisited later if registry growth needs to be pooled.
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
     platform: {
       type: String,
       required: true,
@@ -48,10 +60,10 @@ const fieldRegistrySchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// Unique per (platform, selector) — upsert-safe
-fieldRegistrySchema.index({ platform: 1, selector: 1 }, { unique: true });
+// Unique per (userId, platform, selector) — upsert-safe, isolated per account
+fieldRegistrySchema.index({ userId: 1, platform: 1, selector: 1 }, { unique: true });
 
 // Convenience: high-confidence entries only (successCount >= 2)
-fieldRegistrySchema.index({ platform: 1, successCount: -1 });
+fieldRegistrySchema.index({ userId: 1, platform: 1, successCount: -1 });
 
 export const FieldRegistry = mongoose.model("FieldRegistry", fieldRegistrySchema);

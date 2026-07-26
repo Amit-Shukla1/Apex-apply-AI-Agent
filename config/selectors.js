@@ -56,10 +56,10 @@ export const GREENHOUSE_FIELDS = {
 // Names are standard across all Greenhouse boards that enable EEO.
 export const GREENHOUSE_EEO = {
   // Matched by label text OR by selector ID (e.g. #gender, #hispanic_ethnicity)
-  gender: (p) => p.gender || "Decline to self-identify",
-  race: (p) => p.ethnicity || "Decline to self-identify",
-  hispanic: (p) => p.ethnicity || "Decline to self-identify",
-  hispanic_ethnicity: (p) => p.ethnicity || "Decline to self-identify",
+  gender: (p) => p.gender || "Male",
+  race: (p) => p.ethnicity || "Asian",
+  hispanic: (p) => p.hispanic || "No, not of Hispanic, Latino, or Spanish origin",
+  hispanic_ethnicity: (p) => p.hispanic || "No, not of Hispanic, Latino, or Spanish origin",
   veteran_status: (p) => p.veteran || "I am not a protected veteran",
   veteran: (p) => p.veteran || "I am not a protected veteran",
   disability_status: (p) => p.disability || "I don't wish to answer",
@@ -121,13 +121,45 @@ export const LEVER_FIELDS = {
 // Lever EEO fields — these appear as radio groups or selects under "eeo" section.
 // Names follow: eeo[gender], eeo[race], eeo[veteran], eeo[disability]
 export const LEVER_EEO = {
-  "eeo[gender]": (p) => p.gender || "I prefer not to answer",
-  "eeo[race]": (p) => p.ethnicity || "I prefer not to answer",
-  "eeo[veteran]": (p) => p.veteran || "I prefer not to answer",
-  "eeo[disability]": (p) => p.disability || "I prefer not to answer",
+  "eeo[gender]": (p) => p.gender || "Male",
+  "eeo[race]": (p) => p.ethnicity || "Asian",
+  "eeo[veteran]": (p) => p.veteran || "I am not a protected veteran",
+  "eeo[disability]": (p) => p.disability || "I don't wish to answer",
 };
 
-// ── LINKEDIN ──────────────────────────────────────────────────────────────────
+// ── WORKDAY ───────────────────────────────────────────────────────────────────
+// Workday is structurally different from Greenhouse/Lever: it's a multi-step
+// React wizard, fields are matched by [data-automation-id] (not name/id), and
+// these automation IDs are commonly shared across tenants because they come
+// from Workday's own component framework — but Workday versions/configs do
+// vary more than Greenhouse/Lever's official, documented API fields. Treat
+// this map as best-effort, lower-confidence than the GH/Lever maps above, and
+// expect to refine it once tested against a real Workday application.
+//
+// Covers ONLY the "My Information" step's plain text/select fields. Deliberately
+// does NOT cover:
+//   - "My Experience" (dynamic repeatable rows — too easy to get wrong; the
+//     agent should look for Workday's own "Autofill with resume" feature first)
+//   - "Voluntary Disclosures" / "Self Identify" (race, gender, veteran,
+//     disability) — these are legal self-attestation questions. We do NOT
+//     default these to fabricated values the way GREENHOUSE_EEO/LEVER_EEO
+//     above do. The agent should pause here and let a human answer them.
+export const WORKDAY_FIELDS = {
+  legalNameSection_firstName: (p) =>
+    p.firstName || (p.name || "").split(" ")[0] || "",
+  legalNameSection_lastName: (p) =>
+    p.lastName || (p.name || "").split(" ").slice(1).join(" ") || "",
+  email: (p) => p.email || "",
+  "phone-number": (p) => p.phone || "",
+  addressSection_addressLine1: (p) =>
+    p.address || (p.location || "").split(",")[0].trim() || "",
+  addressSection_city: (p) => p.city || (p.location || "").split(",")[0].trim() || "",
+  addressSection_postalCode: (p) => p.zip || p.postalCode || "",
+  addressSection_countryRegion: (p) => ({ value: p.state || "", action: "select" }),
+  country: (p) => ({ value: p.country || "India", action: "select" }),
+  source: () => ({ action: "skip" }), // "How did you hear about us" — let Groq handle, varies too much
+};
+
 // (Existing selectors kept — Easy Apply modal fields)
 export const LINKEDIN_SELECTORS = {
   jobCard: ".job-card-container",

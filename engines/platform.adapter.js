@@ -13,14 +13,18 @@
 import {
   GREENHOUSE_FIELDS,
   GREENHOUSE_EEO,
+  GREENHOUSE_EDUCATION,
   LEVER_FIELDS,
   LEVER_EEO,
+  WORKDAY_FIELDS,
 } from "../config/selectors.js";
 
 // ── Detect platform from URL ──────────────────────────────────────────────────
 export function detectPlatform(url = "") {
   if (url.includes("greenhouse.io")) return "greenhouse";
   if (url.includes("lever.co")) return "lever";
+  if (url.includes("myworkdayjobs.com") || url.includes(".wd1.myworkday") || url.includes(".wd5.myworkday"))
+    return "workday";
   return null;
 }
 
@@ -163,6 +167,45 @@ function buildLeverActions(fingerprints, profile, log) {
   return { actions, handled };
 }
 
+// ── Build Workday actions ─────────────────────────────────────────────────────
+// Matches by [data-automation-id="..."] instead of name/id. Lower confidence
+// than Greenhouse/Lever (see note in config/selectors.js) — only covers core
+// "My Information" fields. Everything else (experience rows, disclosures,
+// self-identify) is intentionally left for deterministicMap/Groq or a human.
+function buildWorkdayActions(fingerprints, profile, log) {
+  const actions = [];
+  const handled = new Set();
+
+  for (const [fieldId, resolver] of Object.entries(WORKDAY_FIELDS)) {
+    const fp = fingerprints.find(
+      (f) => f.selector === `[data-automation-id="${fieldId}"]`,
+    );
+    if (!fp) continue;
+
+    const result = typeof resolver === "function" ? resolver(profile) : resolver;
+    if (!result) continue;
+
+    const { value, action } =
+      typeof result === "object" && "action" in result
+        ? result
+        : { value: result, action: fp.type === "select" ? "select" : "fill" };
+
+    if (action === "skip" || action === "file") {
+      handled.add(fp.selector);
+      continue;
+    }
+    if (value === "" || value === null || value === undefined) continue;
+
+    actions.push({ selector: fp.selector, action, value: String(value) });
+    handled.add(fp.selector);
+  }
+
+  log(
+    `🎯 [Workday adapter] ${actions.length} field(s) mapped by data-automation-id (best-effort — verify carefully on first runs).`,
+  );
+  return { actions, handled };
+}
+
 // ── Main export ───────────────────────────────────────────────────────────────
 export function platformMap(platform, fingerprints, profile, log) {
   if (platform === "greenhouse") {
@@ -170,6 +213,9 @@ export function platformMap(platform, fingerprints, profile, log) {
   }
   if (platform === "lever") {
     return buildLeverActions(fingerprints, profile, log);
+  }
+  if (platform === "workday") {
+    return buildWorkdayActions(fingerprints, profile, log);
   }
   // Unknown platform — return empty, fall through to deterministicMap + Groq
   return { actions: [], handled: new Set() };
